@@ -1,0 +1,31 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local runtime data and secrets
+.env
+.env.*
+!.env.example
+.secrets/
+.runtime/
+reports/
+
+# Local reference documents and heavy samples
+docs/
+test-data/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Conda / virtualenv
+.venv/
+venv/
+env/
