@@ -27,7 +27,7 @@
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install 'fastapi>=0.110' 'uvicorn[standard]>=0.27' 'pydantic-settings>=2.2' 'python-multipart>=0.0.9' 'pytest>=8.0' 'httpx>=0.27'
+.venv/bin/python -m pip install 'fastapi>=0.110' 'uvicorn>=0.27' 'pydantic-settings>=2.2' 'python-multipart>=0.0.9' 'pytest>=8.0' 'httpx>=0.27'
 .venv/bin/python -m pytest
 env APP_HOST=127.0.0.1 APP_PORT=8091 .venv/bin/python scripts/run_mock_api.py
 ```
