@@ -16,9 +16,10 @@ htmlcov/
 .runtime/
 reports/
 
-# Local reference documents and heavy samples
+# Local reference documents, heavy samples and exploration code
 docs/
 test-data/
+demo_code/
 
 # Build artifacts
 dist/

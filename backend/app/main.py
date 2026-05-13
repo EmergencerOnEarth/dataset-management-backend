@@ -1,24 +1,40 @@
 from __future__ import annotations
 
 import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from backend.app.api.dataset import router as dataset_router
 from backend.app.core.config import get_settings
 from backend.app.core.errors import AppError
 from backend.app.core.responses import error_response
+from backend.app.db.session import init_db
+from backend.app.services.seed_demo import ensure_demo_seed
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_DEMO_INDEX = _REPO_ROOT / "static" / "demo" / "index.html"
 
 settings = get_settings()
 
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Create schema on startup; demo seed is idempotent."""
+    init_db()
+    ensure_demo_seed()
+    yield
+
+
 app = FastAPI(
     title="眼科科研平台数据集管理后端",
-    version="0.1.0",
-    description="数据集管理 mock API 服务，接口契约对齐 V0.2.0 设计文档。",
+    version="0.2.0",
+    description="数据集管理 API：上传、导入、浏览、导出（设计 V0.2.0）。",
     debug=settings.app_debug,
+    lifespan=lifespan,
 )
 
 
@@ -28,6 +44,37 @@ async def trace_middleware(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Trace-Id"] = request.state.trace_id
     return response
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    if settings.app_auth_disabled or path in {"/health", "/docs", "/openapi.json", "/redoc"}:
+        return await call_next(request)
+    if path == "/demo" or path.startswith("/demo/"):
+        return await call_next(request)
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    auth = request.headers.get("Authorization") or ""
+    if not auth.startswith("Bearer "):
+        return error_response(
+            request,
+            status_code=401,
+            code=40101,
+            message="未认证。",
+            error_code="UNAUTHORIZED",
+        )
+    token = auth.removeprefix("Bearer ").strip()
+    allowed = {t.strip() for t in (settings.auth_allowed_tokens or "").split(",") if t.strip()}
+    if allowed and token not in allowed:
+        return error_response(
+            request,
+            status_code=401,
+            code=40101,
+            message="访问令牌无效。",
+            error_code="INVALID_TOKEN",
+        )
+    return await call_next(request)
 
 
 @app.exception_handler(AppError)
@@ -49,7 +96,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
         status_code=422,
         code=42201,
         message="请求参数校验失败。",
-        error_code="REQUEST_VALIDATION_FAILED",
+        error_code="DATASET_VALIDATION_ERROR",
         details={"errors": exc.errors()},
     )
 
@@ -59,5 +106,14 @@ def health():
     return {"status": "ok", "service": "dataset-backend", "env": settings.app_env}
 
 
-app.include_router(dataset_router)
+@app.get("/demo")
+@app.get("/demo/")
+@app.get("/demo/index.html")
+def demo_ui():
+    """极简联调页（避免 Mount /demo 抢走 /demo/ 导致 StaticFiles 目录 404）。"""
+    if not _DEMO_INDEX.is_file():
+        raise HTTPException(status_code=404, detail="static/demo/index.html 不存在，请检查仓库文件。")
+    return FileResponse(_DEMO_INDEX, media_type="text/html; charset=utf-8")
 
+
+app.include_router(dataset_router)

@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>数据集导入 — 极简流程演示</title>
+  <style>
+    body { font-family: sans-serif; max-width: 900px; margin: 16px; }
+    textarea { width: 100%; height: 160px; }
+    button { margin: 4px 8px 4px 0; }
+    label { display: block; margin-top: 8px; }
+    .row { margin: 12px 0; }
+    .hint { color: #444; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>数据集管理 · 主流程演示（静态页）</h1>
+  <p class="hint">同一台开发机浏览器打开本站即可联调。ZIP 内需含问卷 xlsx（「患者ID」「调查日期」）。</p>
+
+  <div class="row">
+    <label>API 根地址（留空=用当前浏览器打开的协议+主机+端口）
+      <input id="base" size="48" value="" placeholder="例: http://127.0.0.1:8092" /></label>
+    <label>Bearer Token（可选，鉴权开启时填写） <input id="token" size="48" /></label>
+  </div>
+
+  <div class="row">
+    <button type="button" id="btnHealth">1) 健康检查</button>
+    <button type="button" id="btnConfig">2) 导入配置 API-01</button>
+  </div>
+
+  <div class="row">
+    <label>选择 ZIP <input id="file" type="file" accept=".zip,application/zip" /></label>
+    <label>合并后校验用 fileHash（可空，上传前会自动算 SHA-256） <input id="fileHash" size="64" readonly /></label>
+    <button type="button" id="btnHash">计算文件 SHA-256</button>
+  </div>
+
+  <div class="row">
+    <button type="button" id="btnInstant">3) 秒传检测 API-03</button>
+    <button type="button" id="btnCreateUpload">4) 初始化上传 API-04</button>
+    <button type="button" id="btnParts">5) 按分片上传 API-05（含 Content-Range）</button>
+    <button type="button" id="btnComplete">6) 合并 API-07</button>
+  </div>
+
+  <div class="row">
+    <label>目录名称（2–30 字） <input id="dirName" value="页面演示目录" size="32" /></label>
+    <label>目录说明（可选） <input id="dirDesc" value="静态页联调" size="40" /></label>
+    <button type="button" id="btnImport">7) 提交导入 API-08</button>
+    <button type="button" id="btnPoll">8) 轮询导入任务 API-09</button>
+  </div>
+
+  <div class="row">
+    <label>directoryId（导入成功后自动填入，可手改） <input id="directoryId" size="40" /></label>
+    <button type="button" id="btnDirs">9) 目录列表 API-02</button>
+    <button type="button" id="btnRecords">10) 数据记录 API-11</button>
+  </div>
+
+  <div class="row">
+    <label>patientId（记录里复制） <input id="patientId" value="LGTA00087" size="20" /></label>
+    <label>surveyDate（影像列表必填） <input id="surveyDate" value="2026-03-03" size="12" /></label>
+    <button type="button" id="btnTimeline">11) 患者时间轴 API-14</button>
+    <button type="button" id="btnImages">12) 患者影像列表 API-15</button>
+  </div>
+
+  <div class="row">
+    <button type="button" id="btnExportDir">13) 目录导出 API-13</button>
+    <button type="button" id="btnExportPatient">14) 患者导出 API-17</button>
+    <span class="hint">导出为异步任务；可在日志看 exportRecordId。</span>
+  </div>
+
+  <h3>日志 / 响应 JSON</h3>
+  <textarea id="log" readonly></textarea>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const logEl = $("log");
+    function log(msg, obj) {
+      const line = typeof obj !== "undefined" ? msg + "\n" + JSON.stringify(obj, null, 2) : String(msg);
+      logEl.value = line + "\n\n" + logEl.value;
+    }
+
+    const state = {
+      uploadId: null,
+      partCount: null,
+      chunkSize: null,
+      fileId: null,
+      importTaskId: null,
+      lastFile: null,
+      lastDigest: null,
+    };
+
+    function baseUrl() {
+      const v = $("base").value.trim();
+      if (v) return v.replace(/\/$/, "");
+      return window.location.origin;
+    }
+
+    function authHeaders(isJson) {
+      const h = {};
+      if (isJson) h["Content-Type"] = "application/json";
+      const t = $("token").value.trim();
+      if (t) h["Authorization"] = "Bearer " + t;
+      return h;
+    }
+
+    async function api(method, path, { jsonBody = null, body = null, headers = {} } = {}) {
+      const url = baseUrl() + path;
+      const opts = { method, headers: { ...authHeaders(!!jsonBody && !body), ...headers } };
+      if (jsonBody !== null) opts.body = JSON.stringify(jsonBody);
+      else if (body !== null) opts.body = body;
+      const resp = await fetch(url, opts);
+      const text = await resp.text();
+      let parsed;
+      try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
+      return { resp, parsed };
+    }
+
+    async function bufSha256(ab) {
+      const hash = await crypto.subtle.digest("SHA-256", ab);
+      return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, "0")).join("");
+    }
+
+    async function partSha256(ab) {
+      return bufSha256(ab);
+    }
+
+    $("btnHealth").onclick = async () => {
+      const { resp, parsed } = await api("GET", "/health");
+      log("health " + resp.status, parsed);
+    };
+
+    $("btnConfig").onclick = async () => {
+      const { resp, parsed } = await api("GET", "/api/v1/dataset-import/config");
+      log("config " + resp.status, parsed);
+    };
+
+    $("btnHash").onclick = async () => {
+      const f = $("file").files[0];
+      if (!f) return log("请先选择 ZIP");
+      const ab = await f.arrayBuffer();
+      state.lastDigest = await bufSha256(ab);
+      state.lastFile = f;
+      $("fileHash").value = state.lastDigest;
+      log("SHA-256 OK", { name: f.name, size: f.size, sha256: state.lastDigest });
+    };
+
+    $("btnInstant").onclick = async () => {
+      const f = state.lastFile || $("file").files[0];
+      if (!f) return log("请先选择文件并计算哈希");
+      if (!$("fileHash").value) return log("请先点「计算文件 SHA-256」");
+      const { resp, parsed } = await api("POST", "/api/v1/dataset-upload/instant-check", {
+        jsonBody: {
+          fileName: f.name,
+          fileSize: f.size,
+          fileHash: $("fileHash").value,
+          businessType: "DATASET_IMPORT",
+        },
+      });
+      log("instant-check " + resp.status, parsed);
+    };
+
+    $("btnCreateUpload").onclick = async () => {
+      const f = state.lastFile || $("file").files[0];
+      if (!f || !$("fileHash").value) return log("请选择文件并计算哈希");
+      const chunk = 5 * 1024 * 1024;
+      const { resp, parsed } = await api("POST", "/api/v1/dataset-upload/uploads", {
+        jsonBody: {
+          fileName: f.name,
+          fileSize: f.size,
+          fileHash: $("fileHash").value,
+          chunkSize: chunk,
+          businessType: "DATASET_IMPORT",
+        },
+      });
+      if (parsed && parsed.data) {
+        state.uploadId = parsed.data.uploadId;
+        state.partCount = parsed.data.partCount;
+        state.chunkSize = parsed.data.chunkSize;
+      }
+      log("create upload " + resp.status, parsed);
+    };
+
+    $("btnParts").onclick = async () => {
+      const f = state.lastFile || $("file").files[0];
+      if (!state.uploadId) return log("请先初始化上传");
+      const n = f.size;
+      const cs = state.chunkSize;
+      for (let part = 1; part <= state.partCount; part++) {
+        const start = (part - 1) * cs;
+        const end = Math.min(part * cs, n) - 1;
+        if (start >= n) break;
+        const slice = f.slice(start, end + 1);
+        const ab = await slice.arrayBuffer();
+        const ph = await partSha256(ab);
+        const { resp, parsed } = await api(
+          "PUT",
+          `/api/v1/dataset-upload/uploads/${state.uploadId}/parts/${part}`,
+          {
+            body: ab,
+            headers: {
+              "Content-Type": "application/octet-stream",
+              "Content-Range": `bytes ${start}-${end}/${n}`,
+              "X-Part-Hash": ph,
+              ...authHeaders(false),
+            },
+          }
+        );
+        log(`part ${part}/${state.partCount} ` + resp.status, parsed);
+        if (!resp.ok) return;
+      }
+      log("全部分片上传完成");
+    };
+
+    $("btnComplete").onclick = async () => {
+      if (!state.uploadId) return log("无 uploadId");
+      const { resp, parsed } = await api("POST", `/api/v1/dataset-upload/uploads/${state.uploadId}/complete`, {
+        jsonBody: { fileHash: $("fileHash").value },
+      });
+      if (parsed && parsed.data) state.fileId = parsed.data.fileId;
+      log("complete " + resp.status, parsed);
+    };
+
+    $("btnImport").onclick = async () => {
+      if (!state.fileId) return log("无 fileId，请先合并");
+      const name = $("dirName").value.trim();
+      if (name.length < 2 || name.length > 30) return log("目录名称长度须 2–30");
+      const { resp, parsed } = await api("POST", "/api/v1/dataset-directories", {
+        jsonBody: {
+          directoryName: name,
+          directoryDescription: $("dirDesc").value.trim() || undefined,
+          fileId: state.fileId,
+        },
+      });
+      if (parsed && parsed.data) {
+        state.importTaskId = parsed.data.importTaskId;
+        $("directoryId").value = parsed.data.directoryId || "";
+      }
+      log("import " + resp.status, parsed);
+    };
+
+    let pollTimer = null;
+    $("btnPoll").onclick = async () => {
+      if (!state.importTaskId) return log("无 importTaskId");
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+        log("停止轮询");
+        return;
+      }
+      pollTimer = setInterval(async () => {
+        const { resp, parsed } = await api("GET", `/api/v1/dataset-import/tasks/${state.importTaskId}`);
+        log("poll " + resp.status, parsed);
+        const st = parsed && parsed.data && parsed.data.importStatus;
+        if (st === "SUCCESS" || st === "FAILED") {
+          clearInterval(pollTimer);
+          pollTimer = null;
+          log("导入终态: " + st);
+        }
+      }, 800);
+      log("开始轮询（再点一次可停止）");
+    };
+
+    $("btnDirs").onclick = async () => {
+      const q = new URLSearchParams({ pageNo: "1", pageSize: "20" });
+      const { resp, parsed } = await api("GET", "/api/v1/dataset-directories?" + q.toString());
+      log("directories " + resp.status, parsed);
+    };
+
+    $("btnRecords").onclick = async () => {
+      const did = $("directoryId").value.trim();
+      if (!did) return log("请填写 directoryId");
+      const q = new URLSearchParams({ pageNo: "1", pageSize: "20" });
+      const { resp, parsed } = await api("GET", `/api/v1/dataset-directories/${did}/records?` + q.toString());
+      log("records " + resp.status, parsed);
+    };
+
+    $("btnTimeline").onclick = async () => {
+      const did = $("directoryId").value.trim();
+      const pid = $("patientId").value.trim();
+      if (!did || !pid) return log("directoryId / patientId 必填");
+      const { resp, parsed } = await api("GET", `/api/v1/dataset-directories/${did}/patients/${pid}/timeline`);
+      log("timeline " + resp.status, parsed);
+    };
+
+    $("btnImages").onclick = async () => {
+      const did = $("directoryId").value.trim();
+      const pid = $("patientId").value.trim();
+      const sd = $("surveyDate").value.trim();
+      if (!did || !pid || !sd) return log("directoryId / patientId / surveyDate 必填");
+      const q = new URLSearchParams({ surveyDate: sd, pageNo: "1", pageSize: "20" });
+      const { resp, parsed } = await api("GET", `/api/v1/dataset-directories/${did}/patients/${pid}/images?` + q.toString());
+      log("images " + resp.status, parsed);
+    };
+
+    $("btnExportDir").onclick = async () => {
+      const did = $("directoryId").value.trim();
+      if (!did) return log("请填写 directoryId");
+      const { resp, parsed } = await api("POST", "/api/v1/dataset-directories/export", {
+        jsonBody: { directoryIds: [did] },
+      });
+      log("export directory " + resp.status, parsed);
+    };
+
+    $("btnExportPatient").onclick = async () => {
+      const did = $("directoryId").value.trim();
+      const pid = $("patientId").value.trim();
+      if (!did || !pid) return log("directoryId / patientId 必填");
+      const { resp, parsed } = await api(
+        "POST",
+        `/api/v1/dataset-directories/${did}/patients/${pid}/export`,
+        { jsonBody: {} }
+      );
+      log("export patient " + resp.status, parsed);
+    };
+  </script>
+</body>
+</html>

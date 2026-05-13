@@ -1,13 +1,31 @@
+"""
+数据集 REST 路由，对照设计 §3.2：API-01～17。
+
+分块：导入配置 / 上传（instant-check～complete）/ 目录与导入任务 /
+动态浏览与影像 / 目录与患者导出 / 静态影像流 ``dataset-files``。
+"""
+
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, Body, Header, Query, Request
+from fastapi import APIRouter, Header, Query, Request, Response
 from pydantic import BaseModel, Field
 
+from backend.app.api.deps import DbSession, StorageDep
+from backend.app.core.errors import NotFoundError
 from backend.app.core.responses import ok
-from backend.app.services.mock_store import store
+from backend.app.db.models import DatasetImageAsset
+from backend.app.parsers.image_stubs import STUB_JPEG_BYTES
+from backend.app.storage.backend import normalize_storage_path
+from backend.app.services import directory_service, upload_service
+from backend.app.workers.async_dispatch import (
+    run_directory_export_after_commit,
+    run_import_after_commit,
+    run_patient_export_after_commit,
+)
 
 router = APIRouter(prefix="/api/v1", tags=["dataset"])
 
@@ -17,7 +35,7 @@ class InstantCheckRequest(BaseModel):
     fileSize: int
     fileHash: str
     hashAlgorithm: str = "SHA-256"
-    businessType: str = "DATASET_IMPORT"
+    businessType: str
 
 
 class CreateUploadRequest(BaseModel):
@@ -29,8 +47,11 @@ class CreateUploadRequest(BaseModel):
 
 
 class CompleteUploadRequest(BaseModel):
+    """合并分片：当前实现仅校验整包 ``fileHash``；``parts`` 若由前端携带（如 etag 字符串列表）应忽略而非 422。"""
+
+    model_config = {"extra": "ignore"}
+
     fileHash: str
-    parts: Optional[list[dict[str, Any]]] = None
 
 
 class CreateDirectoryRequest(BaseModel):
@@ -62,126 +83,230 @@ class PatientExportRequest(BaseModel):
 
 @router.get("/dataset-import/config")
 def import_config(request: Request):
-    return ok(request, store.import_config())
+    return ok(request, upload_service.import_config_dict())
 
 
 @router.get("/dataset-directories")
 def list_directories(
     request: Request,
+    db: DbSession,
     directoryName: Optional[str] = Query(default=None),
     importStatus: Optional[str] = Query(default=None),
+    importedAtStart: Optional[str] = Query(default=None),
+    importedAtEnd: Optional[str] = Query(default=None),
     pageNo: int = Query(default=1, ge=1),
     pageSize: int = Query(default=10, ge=1, le=200),
 ):
     return ok(
         request,
-        store.list_directories(
-            page_no=pageNo,
-            page_size=pageSize,
+        directory_service.list_directories(
+            db,
             directory_name=directoryName,
             import_status=importStatus,
+            imported_at_start=importedAtStart,
+            imported_at_end=importedAtEnd,
+            page_no=pageNo,
+            page_size=pageSize,
         ),
     )
 
 
 @router.post("/dataset-upload/instant-check")
-def instant_check(request: Request, body: InstantCheckRequest):
-    return ok(request, store.instant_check(body.model_dump()))
+def instant_check(request: Request, db: DbSession, body: InstantCheckRequest):
+    return ok(request, upload_service.instant_check(db, body.model_dump()))
 
 
 @router.post("/dataset-upload/uploads")
-def create_upload(request: Request, body: CreateUploadRequest):
-    return ok(request, store.create_upload(body.model_dump()))
+def create_upload(request: Request, db: DbSession, storage: StorageDep, body: CreateUploadRequest):
+    return ok(request, upload_service.create_upload_task(db, storage, body.model_dump()))
 
 
 @router.put("/dataset-upload/uploads/{upload_id}/parts/{part_number}")
 async def put_part(
     request: Request,
+    db: DbSession,
+    storage: StorageDep,
     upload_id: str,
     part_number: int,
+    content_range: Optional[str] = Header(default=None, alias="Content-Range"),
     x_part_hash: Optional[str] = Header(default=None, alias="X-Part-Hash"),
 ):
     data = await request.body()
-    return ok(request, await store.put_part(upload_id, part_number, data, x_part_hash))
+    return ok(
+        request,
+        upload_service.put_upload_part(
+            db,
+            storage,
+            upload_id=upload_id,
+            part_number=part_number,
+            body=data,
+            content_range=content_range,
+            x_part_hash=x_part_hash,
+        ),
+    )
 
 
 @router.get("/dataset-upload/uploads/{upload_id}")
-def get_upload(request: Request, upload_id: str):
-    return ok(request, store.get_upload(upload_id))
+def get_upload(request: Request, db: DbSession, upload_id: str):
+    return ok(request, upload_service.get_upload_task(db, upload_id))
 
 
 @router.post("/dataset-upload/uploads/{upload_id}/complete")
-def complete_upload(request: Request, upload_id: str, body: CompleteUploadRequest):
-    return ok(request, store.complete_upload(upload_id, body.fileHash))
+def complete_upload(request: Request, db: DbSession, storage: StorageDep, upload_id: str, body: CompleteUploadRequest):
+    return ok(request, upload_service.complete_upload(db, storage, upload_id, body.fileHash))
 
 
 @router.post("/dataset-directories")
-def create_directory(request: Request, body: CreateDirectoryRequest):
-    return ok(request, store.create_directory(body.model_dump()))
+def create_directory(
+    request: Request,
+    db: DbSession,
+    storage: StorageDep,
+    body: CreateDirectoryRequest,
+):
+    payload = directory_service.create_directory(db, body.model_dump())
+    run_import_after_commit(storage, payload["importTaskId"])
+    return ok(request, payload)
 
 
 @router.get("/dataset-import/tasks/{import_task_id}")
-def get_import_task(request: Request, import_task_id: str):
-    return ok(request, store.get_import_task(import_task_id))
+def get_import_task(request: Request, db: DbSession, import_task_id: str):
+    return ok(request, directory_service.get_import_task(db, import_task_id))
 
 
 @router.post("/dataset-directories/{directory_id}/reimport")
-def reimport(request: Request, directory_id: str, body: ReimportRequest):
-    return ok(request, store.reimport(directory_id, body.model_dump()))
+def reimport(
+    request: Request,
+    db: DbSession,
+    storage: StorageDep,
+    directory_id: str,
+    body: ReimportRequest,
+):
+    payload = directory_service.reimport_directory(db, directory_id, body.model_dump())
+    run_import_after_commit(storage, payload["importTaskId"])
+    return ok(request, payload)
 
 
 @router.get("/dataset-directories/{directory_id}/records")
 def directory_records(
     request: Request,
+    db: DbSession,
     directory_id: str,
     patientId: Optional[str] = Query(default=None),
+    surveyDateStart: Optional[str] = Query(default=None),
+    surveyDateEnd: Optional[str] = Query(default=None),
     pageNo: int = Query(default=1, ge=1),
     pageSize: int = Query(default=10, ge=1, le=200),
 ):
-    return ok(request, store.directory_records(directory_id, pageNo, pageSize, patientId))
+    return ok(
+        request,
+        directory_service.directory_records(
+            db,
+            directory_id,
+            patient_id=patientId,
+            survey_date_start=surveyDateStart,
+            survey_date_end=surveyDateEnd,
+            page_no=pageNo,
+            page_size=pageSize,
+        ),
+    )
 
 
 @router.delete("/dataset-directories/{directory_id}")
-def delete_directory(request: Request, directory_id: str):
-    return ok(request, store.delete_directory(directory_id))
+def delete_directory(request: Request, db: DbSession, directory_id: str):
+    return ok(request, directory_service.delete_directory(db, directory_id))
 
 
 @router.post("/dataset-directories/export")
-def export_directories(request: Request, body: DirectoryExportRequest):
-    joined = "-".join(body.directoryIds[:3])
-    file_name = f"{joined}-20260506120000.zip"
-    return ok(request, store.create_export("DATASET_DIRECTORY", file_name))
+def export_directories(
+    request: Request,
+    db: DbSession,
+    storage: StorageDep,
+    body: DirectoryExportRequest,
+):
+    payload = directory_service.create_directory_export(db, body.model_dump())
+    run_directory_export_after_commit(storage, payload["exportRecordId"])
+    return ok(request, payload)
 
 
 @router.get("/dataset-directories/{directory_id}/patients/{patient_id}/timeline")
-def patient_timeline(request: Request, directory_id: str, patient_id: str):
-    return ok(request, store.timeline(directory_id, patient_id))
+def patient_timeline(request: Request, db: DbSession, directory_id: str, patient_id: str):
+    return ok(request, directory_service.patient_timeline(db, directory_id, patient_id))
 
 
 @router.get("/dataset-directories/{directory_id}/patients/{patient_id}/images")
 def patient_images(
     request: Request,
+    db: DbSession,
     directory_id: str,
     patient_id: str,
     surveyDate: str = Query(),
     pageNo: int = Query(default=1, ge=1),
     pageSize: int = Query(default=20, ge=1, le=200),
 ):
-    return ok(request, store.patient_images(directory_id, patient_id, surveyDate, pageNo, pageSize))
+    return ok(
+        request,
+        directory_service.patient_images(db, directory_id, patient_id, surveyDate, pageNo, pageSize),
+    )
 
 
 @router.get("/dataset-directories/{directory_id}/patients/{patient_id}/images/{image_id}")
-def image_detail(request: Request, directory_id: str, patient_id: str, image_id: str):
-    return ok(request, store.image_detail(directory_id, patient_id, image_id))
+def image_detail(request: Request, db: DbSession, directory_id: str, patient_id: str, image_id: str):
+    return ok(request, directory_service.image_detail(db, directory_id, patient_id, image_id))
 
 
 @router.post("/dataset-directories/{directory_id}/patients/{patient_id}/export")
-def export_patient(request: Request, directory_id: str, patient_id: str, body: PatientExportRequest):
-    file_name = f"患者数据导出-{patient_id}-20260506120000.zip"
-    return ok(request, store.create_export("DATASET_PATIENT", file_name))
+def export_patient(
+    request: Request,
+    db: DbSession,
+    storage: StorageDep,
+    directory_id: str,
+    patient_id: str,
+    body: PatientExportRequest,
+):
+    payload = directory_service.create_patient_export(db, directory_id, patient_id, body.model_dump())
+    run_patient_export_after_commit(storage, payload["exportRecordId"])
+    return ok(request, payload)
+
+
+def _parsed_jpeg_logical_path(img: DatasetImageAsset) -> str:
+    if getattr(img, "parsed_path", None):
+        return normalize_storage_path(img.parsed_path)
+    stem = Path(img.image_name).stem
+    base = f"/dataset/import/parsed/{img.directory_id}"
+    if img.source_type == "PARSED_FDT":
+        return normalize_storage_path(f"{base}/fundus/{stem}.jpg")
+    if img.source_type == "PARSED_DAT":
+        return normalize_storage_path(f"{base}/oct/{stem}.jpg")
+    return normalize_storage_path(f"{base}/{stem}.jpg")
+
+
+@router.get("/dataset-files/{image_id}/{variant}")
+def serve_image_file(
+    image_id: str,
+    variant: str,
+    db: DbSession,
+    storage: StorageDep,
+):
+    """缩略图/预览读解析 jpeg；原图按 ``original_path`` 经存储后端读取（FTP 与 local 统一）。"""
+    img = db.get(DatasetImageAsset, image_id)
+    if not img or img.deleted:
+        raise NotFoundError("影像不存在。")
+    if variant in ("thumbnail", "preview"):
+        lp = _parsed_jpeg_logical_path(img)
+        if storage.exists(lp):
+            body = storage.get_bytes(lp)
+            mt = "image/png" if lp.lower().endswith(".png") else "image/jpeg"
+            return Response(content=body, media_type=mt)
+        return Response(content=STUB_JPEG_BYTES, media_type="image/jpeg")
+    if variant == "original":
+        op = normalize_storage_path(img.original_path)
+        if storage.exists(op):
+            return Response(content=storage.get_bytes(op), media_type="application/octet-stream")
+        return Response(content=STUB_JPEG_BYTES, media_type="image/jpeg")
+    raise NotFoundError("影像不存在。")
 
 
 @router.get("/mock-files/{image_id}/{variant}")
-def mock_file_url(request: Request, image_id: str, variant: str):
+def mock_file_url_compat(request: Request, image_id: str, variant: str):
     content_hash = hashlib.sha256(f"{image_id}:{variant}".encode()).hexdigest()
     return ok(request, {"imageId": image_id, "variant": variant, "mockContentHash": content_hash})
