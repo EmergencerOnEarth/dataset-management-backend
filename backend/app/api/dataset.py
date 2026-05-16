@@ -43,7 +43,7 @@ class CreateUploadRequest(BaseModel):
     fileSize: int
     fileHash: str
     chunkSize: Optional[int] = None
-    businessType: str = "DATASET_IMPORT"
+    businessType: str
 
 
 class CompleteUploadRequest(BaseModel):
@@ -153,7 +153,11 @@ def get_upload(request: Request, db: DbSession, upload_id: str):
 
 @router.post("/dataset-upload/uploads/{upload_id}/complete")
 def complete_upload(request: Request, db: DbSession, storage: StorageDep, upload_id: str, body: CompleteUploadRequest):
-    return ok(request, upload_service.complete_upload(db, storage, upload_id, body.fileHash))
+    payload = upload_service.complete_upload(db, storage, upload_id, body.fileHash)
+    # Commit before returning so a immediately following create-directory request (possibly on
+    # another worker) sees ``DatasetMergedFile``; teardown commit runs after the response is sent.
+    db.commit()
+    return ok(request, payload)
 
 
 @router.post("/dataset-directories")
@@ -164,13 +168,14 @@ def create_directory(
     body: CreateDirectoryRequest,
 ):
     payload = directory_service.create_directory(db, body.model_dump())
+    db.commit()
     run_import_after_commit(storage, payload["importTaskId"])
     return ok(request, payload)
 
 
 @router.get("/dataset-import/tasks/{import_task_id}")
-def get_import_task(request: Request, db: DbSession, import_task_id: str):
-    return ok(request, directory_service.get_import_task(db, import_task_id))
+def get_import_task(request: Request, db: DbSession, storage: StorageDep, import_task_id: str):
+    return ok(request, directory_service.get_import_task(db, import_task_id, storage=storage))
 
 
 @router.post("/dataset-directories/{directory_id}/reimport")
@@ -182,6 +187,7 @@ def reimport(
     body: ReimportRequest,
 ):
     payload = directory_service.reimport_directory(db, directory_id, body.model_dump())
+    db.commit()
     run_import_after_commit(storage, payload["importTaskId"])
     return ok(request, payload)
 
@@ -224,6 +230,7 @@ def export_directories(
     body: DirectoryExportRequest,
 ):
     payload = directory_service.create_directory_export(db, body.model_dump())
+    db.commit()
     run_directory_export_after_commit(storage, payload["exportRecordId"])
     return ok(request, payload)
 
@@ -264,6 +271,7 @@ def export_patient(
     body: PatientExportRequest,
 ):
     payload = directory_service.create_patient_export(db, directory_id, patient_id, body.model_dump())
+    db.commit()
     run_patient_export_after_commit(storage, payload["exportRecordId"])
     return ok(request, payload)
 
@@ -304,6 +312,31 @@ def serve_image_file(
             return Response(content=storage.get_bytes(op), media_type="application/octet-stream")
         return Response(content=STUB_JPEG_BYTES, media_type="image/jpeg")
     raise NotFoundError("影像不存在。")
+
+
+@router.get("/dataset-files/{image_id}/frame/{frame_name}")
+def serve_oct_frame(
+    image_id: str,
+    frame_name: str,
+    db: DbSession,
+    storage: StorageDep,
+):
+    """按帧名返回 OCT DAT 解析帧 PNG。
+    frame_name 形如 ``frame_00000.png``；从 parsed_path 推算帧目录，直接读取对应文件。
+    前端可遍历 metadata.octDat.frames 列表，依次请求此接口实现滚动播放。
+    """
+    img = db.get(DatasetImageAsset, image_id)
+    if not img or img.deleted:
+        raise NotFoundError("影像不存在。")
+    if not getattr(img, "parsed_path", None):
+        raise NotFoundError("该影像无解析帧。")
+    # parsed_path 指向 frame_00000.png，其父目录即帧目录
+    frames_dir = normalize_storage_path(str(Path(img.parsed_path).parent))
+    target = f"{frames_dir}/{frame_name}"
+    if not storage.exists(target):
+        raise NotFoundError(f"帧文件不存在: {frame_name}")
+    body = storage.get_bytes(target)
+    return Response(content=body, media_type="image/png")
 
 
 @router.get("/mock-files/{image_id}/{variant}")
