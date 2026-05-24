@@ -5,12 +5,14 @@ FROM ${PY_IMAGE}
 
 WORKDIR /app
 
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_DEFAULT_TIMEOUT=120
+
 COPY pyproject.toml ./
 COPY backend ./backend
 COPY static ./static
 
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir .
+RUN pip install --no-cache-dir --no-build-isolation .
 
 RUN useradd --system --uid 10001 --shell /usr/sbin/nologin app \
     && mkdir -p /app/.runtime \
