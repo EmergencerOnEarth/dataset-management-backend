@@ -12,6 +12,9 @@ htmlcov/
 .env
 .env.*
 !.env.example
+
+# Docker 本地密钥（由 docker.local.env.example 复制）
+docker.local.env
 .secrets/
 .runtime/
 reports/

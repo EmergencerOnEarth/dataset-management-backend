@@ -15,7 +15,16 @@ from typing import Any
 
 from sqlalchemy import select
 
-from backend.app.db.models import DatasetImageAsset, DatasetImageMetadata, DatasetQuestionnaireRecord, ExportRecord
+from sqlalchemy.orm import Session
+
+from backend.app.db.models import (
+    DatasetDirectory,
+    DatasetImageAsset,
+    DatasetImageMetadata,
+    DatasetMergedFile,
+    DatasetQuestionnaireRecord,
+    ExportRecord,
+)
 from backend.app.storage.backend import StorageBackend, normalize_storage_path
 
 
@@ -29,12 +38,22 @@ def _zip_member_safe(name: str) -> bool:
     return ".." not in p.parts and not p.is_absolute()
 
 
+def _resolve_directory_source_zip(storage: StorageBackend, db: Session, directory_id: str) -> str:
+    canonical = f"/dataset/import/raw_zip/{directory_id}/source.zip"
+    if storage.exists(canonical):
+        return canonical
+    directory = db.get(DatasetDirectory, directory_id)
+    if directory and directory.raw_zip_file_id:
+        merged = db.get(DatasetMergedFile, directory.raw_zip_file_id)
+        if merged and storage.exists(merged.ftp_path):
+            return merged.ftp_path
+    raise ExportSourceZipMissing(directory_id)
+
+
 def _append_directory_tree_from_source(
-    zf: zipfile.ZipFile, storage: StorageBackend, directory_id: str
+    zf: zipfile.ZipFile, storage: StorageBackend, db: Session, directory_id: str
 ) -> None:
-    zip_path = f"/dataset/import/raw_zip/{directory_id}/source.zip"
-    if not storage.exists(zip_path):
-        raise ExportSourceZipMissing(directory_id)
+    zip_path = _resolve_directory_source_zip(storage, db, directory_id)
     raw_zip = storage.get_bytes(zip_path)
     with zipfile.ZipFile(BytesIO(raw_zip), "r") as inner:
         for m in inner.infolist():
@@ -61,7 +80,7 @@ def run_directory_export_job(storage: StorageBackend, export_record_id: str) -> 
         buf = BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for did in ids:
-                _append_directory_tree_from_source(zf, storage, did)
+                _append_directory_tree_from_source(zf, storage, db, did)
                 if include_parsed:
                     imgs = db.execute(
                         select(DatasetImageAsset).where(

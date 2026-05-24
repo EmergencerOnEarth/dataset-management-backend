@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -14,11 +16,29 @@ from backend.app.core.errors import AppError
 from backend.app.core.responses import error_response
 from backend.app.db.session import init_db
 from backend.app.services.seed_demo import ensure_demo_seed
+from backend.app.workers.import_recovery import recover_stalled_import_tasks_on_startup
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEMO_INDEX = _REPO_ROOT / "static" / "demo" / "index.html"
 
 settings = get_settings()
+_logger = logging.getLogger(__name__)
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+_IMPORT_RECOVERY_INTERVAL_S = 30.0
+
+
+async def _import_recovery_loop() -> None:
+    while True:
+        await asyncio.sleep(_IMPORT_RECOVERY_INTERVAL_S)
+        try:
+            await asyncio.to_thread(recover_stalled_import_tasks_on_startup)
+        except Exception:
+            _logger.exception("periodic import recovery failed")
 
 
 @asynccontextmanager
@@ -26,7 +46,16 @@ async def lifespan(_: FastAPI):
     """Create schema on startup; demo seed is idempotent."""
     init_db()
     ensure_demo_seed()
-    yield
+    recover_stalled_import_tasks_on_startup()
+    recovery_task = asyncio.create_task(_import_recovery_loop())
+    try:
+        yield
+    finally:
+        recovery_task.cancel()
+        try:
+            await recovery_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(

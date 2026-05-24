@@ -131,6 +131,30 @@ def test_upload_flow_and_import_task(client: TestClient):
     assert task["progress"] == 100
 
 
+def test_frame_url_helper():
+    from types import SimpleNamespace
+
+    from backend.app.services.directory_service import _frame_url
+
+    oct_img = SimpleNamespace(
+        image_id="img_oct",
+        parsed_path=(
+            "/dataset/import/parsed/dir_x/oct_frames/tag/"
+            "od-3dscan-macular-001.frames/frame_00000.png"
+        ),
+    )
+    assert _frame_url(oct_img) == "/api/v1/dataset-files/img_oct/frame/"
+
+    jpg_only = SimpleNamespace(
+        image_id="img_jpg",
+        parsed_path="/dataset/import/parsed/dir_x/oct/foo.jpg",
+    )
+    assert _frame_url(jpg_only) is None
+
+    no_parsed = SimpleNamespace(image_id="img_none", parsed_path=None)
+    assert _frame_url(no_parsed) is None
+
+
 def test_records_patient_images_and_exports(client: TestClient):
     records = data(client.get("/api/v1/dataset-directories/dir_demo_001/records"))
     assert records["columns"]
@@ -151,6 +175,17 @@ def test_records_patient_images_and_exports(client: TestClient):
     assert detail["metadata"]["width"] == 1024
     assert images["records"][0]["originalUrl"] == "/api/v1/dataset-files/img_001/original"
     assert detail["originalUrl"] == "/api/v1/dataset-files/img_001/original"
+    assert images["records"][0].get("frameUrl") is None
+    assert detail.get("frameUrl") is None
+
+    oct_images = data(
+        client.get(
+            "/api/v1/dataset-directories/dir_demo_001/patients/LGTA00101/images",
+            params={"surveyDate": "2026-03-06"},
+        )
+    )
+    assert oct_images["records"][0]["imageId"] == "img_002"
+    assert oct_images["records"][0].get("frameUrl") is None
 
     directory_export = data(
         client.post("/api/v1/dataset-directories/export", json={"directoryIds": ["dir_demo_001"]})
@@ -301,6 +336,7 @@ def test_import_pipeline_with_fdt_placeholder(client: TestClient):
                 "fileSize": len(content),
                 "fileHash": fh,
                 "chunkSize": 1024 * 1024,
+                "businessType": "DATASET_IMPORT",
             },
         )
     )
@@ -393,6 +429,7 @@ def test_oct_sidecar_adds_dynamic_columns(client: TestClient):
                 "fileSize": len(content),
                 "fileHash": fh,
                 "chunkSize": 1024 * 1024,
+                "businessType": "DATASET_IMPORT",
             },
         )
     )
@@ -453,6 +490,7 @@ def test_vendor_marker_zip_rejected_until_implemented(client: TestClient):
                 "fileSize": len(content),
                 "fileHash": fh,
                 "chunkSize": 1024 * 1024,
+                "businessType": "DATASET_IMPORT",
             },
         )
     )
@@ -509,6 +547,7 @@ def test_oct_path_folder_case_insensitive(client: TestClient):
                 "fileSize": len(content),
                 "fileHash": fh,
                 "chunkSize": 1024 * 1024,
+                "businessType": "DATASET_IMPORT",
             },
         )
     )
@@ -568,6 +607,7 @@ def test_patient_export_contains_parsed_jpeg_and_oct_json(client: TestClient):
                 "fileSize": len(content),
                 "fileHash": fh,
                 "chunkSize": 1024 * 1024,
+                "businessType": "DATASET_IMPORT",
             },
         )
     )
@@ -631,6 +671,95 @@ def test_patient_export_contains_parsed_jpeg_and_oct_json(client: TestClient):
     assert any(n.startswith("images/") and n.lower().endswith(".fdt") for n in names)
 
 
+def test_export_list_detail_and_download(client: TestClient):
+    """API-18/19：导出任务列表、详情与受控下载。"""
+    from backend.app.db.models import ExportRecord
+    from backend.app.db.session import get_session_factory
+
+    content = _minimal_zip_with_xlsx()
+    task, _tid = _flow_upload_import(client, content, "导出查询测")
+    assert task["importStatus"] == "SUCCESS"
+    did = task["directoryId"]
+
+    dir_exp = data(
+        client.post(
+            "/api/v1/dataset-directories/export",
+            json={"directoryIds": [did], "includeParsedImages": True},
+        )
+    )
+    pat_exp = data(
+        client.post(
+            f"/api/v1/dataset-directories/{did}/patients/LGTA00087/export",
+            json={"includeParsedImages": True},
+        )
+    )
+
+    listing = data(client.get("/api/v1/dataset-exports", params={"offset": 0, "limit": 20}))
+    assert listing["total"] >= 2
+    assert listing["offset"] == 0
+    assert listing["limit"] == 20
+    types = {r["exportType"] for r in listing["records"]}
+    assert "DATASET_DIRECTORY" in types
+    assert "DATASET_PATIENT" in types
+    for rec in listing["records"]:
+        assert rec["exportRecordId"]
+        assert rec["exportTypeName"]
+        assert rec["exportStatusName"]
+        assert "downloadable" in rec
+        assert "summary" in rec
+        assert "ftp" not in (rec.get("downloadUrl") or "").lower()
+
+    page2 = data(client.get("/api/v1/dataset-exports", params={"offset": 1, "limit": 1}))
+    assert page2["total"] == listing["total"]
+    assert page2["offset"] == 1
+    assert len(page2["records"]) == 1
+
+    filtered = data(
+        client.get(
+            "/api/v1/dataset-exports",
+            params={"exportType": "DATASET_PATIENT", "exportStatus": "PREPARING"},
+        )
+    )
+    assert all(r["exportType"] == "DATASET_PATIENT" for r in filtered["records"])
+
+    detail = data(client.get(f"/api/v1/dataset-exports/{dir_exp['exportRecordId']}"))
+    assert detail["exportRecordId"] == dir_exp["exportRecordId"]
+    assert detail["exportType"] == "DATASET_DIRECTORY"
+    assert detail["payload"]["directoryIds"] == [did]
+    assert detail["downloadable"] is False
+    assert detail["downloadUrl"] is None
+
+    missing = client.get("/api/v1/dataset-exports/exp_not_exists")
+    assert missing.status_code == 404
+
+    bad_page = client.get("/api/v1/dataset-exports", params={"offset": 0, "limit": 0})
+    assert bad_page.status_code == 422
+
+    done_id = pat_exp["exportRecordId"]
+    for _ in range(180):
+        fac = get_session_factory()
+        db = fac()
+        try:
+            er = db.get(ExportRecord, done_id)
+            if er and er.export_status in ("DONE", "FAILED"):
+                assert er.export_status == "DONE", (er.export_status, er.failure_reason)
+                break
+        finally:
+            db.close()
+        time.sleep(0.05)
+
+    done_detail = data(client.get(f"/api/v1/dataset-exports/{done_id}"))
+    assert done_detail["exportStatus"] == "DONE"
+    assert done_detail["downloadable"] is True
+    assert done_detail["downloadUrl"] == f"/api/v1/dataset-exports/{done_id}/download"
+    assert "ftp" not in done_detail["downloadUrl"].lower()
+
+    dl = client.get(done_detail["downloadUrl"])
+    assert dl.status_code == 200
+    assert dl.headers.get("content-type", "").startswith("application/zip")
+    assert zipfile.is_zipfile(io.BytesIO(dl.content))
+
+
 def _flow_upload_import(client: TestClient, content: bytes, directory_name: str, *, complete_extra: dict | None = None) -> tuple[dict, str]:
     fh = hashlib.sha256(content).hexdigest()
     u = data(
@@ -641,6 +770,7 @@ def _flow_upload_import(client: TestClient, content: bytes, directory_name: str,
                 "fileSize": len(content),
                 "fileHash": fh,
                 "chunkSize": 1024 * 1024,
+                "businessType": "DATASET_IMPORT",
             },
         )
     )

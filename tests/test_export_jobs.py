@@ -15,4 +15,4 @@ def test_append_directory_tree_requires_source_zip():
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         with pytest.raises(ExportSourceZipMissing):
-            _append_directory_tree_from_source(zf, st, "dir_missing")
+            _append_directory_tree_from_source(zf, st, MagicMock(), "dir_missing")

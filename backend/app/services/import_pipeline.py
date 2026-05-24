@@ -9,16 +9,23 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import io
+import logging
+import os
 import re
+import tempfile
+import threading
+import time
 import zipfile
+from collections import defaultdict
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
+from backend.app.core.config import get_settings
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.db.models import (
     DatasetDirectory,
@@ -45,6 +52,43 @@ from backend.app.parsers.registry import SUPPORTED_PACKAGE_LAYOUTS, detect_datas
 from backend.app.storage.backend import StorageBackend
 from backend.app.util.ids import new_id
 
+logger = logging.getLogger(__name__)
+
+# Re-uploading multi‑GiB zips to ``import/raw_zip`` doubles FTP time and disk use.
+_SKIP_RAW_ZIP_REUPLOAD_BYTES = 200 * 1024 * 1024
+_FETCH_PROGRESS_COMMIT_INTERVAL_S = 10.0
+
+_task_run_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
+_active_import_tasks: set[str] = set()
+_active_import_lock = threading.Lock()
+
+
+def is_import_task_active(import_task_id: str) -> bool:
+    with _active_import_lock:
+        return import_task_id in _active_import_tasks
+
+
+def _commit_import_progress(db: Session, task: DatasetImportTask, *, progress: int, stage: str) -> None:
+    task.status = "IMPORTING"
+    task.progress = progress
+    task.stage = stage
+    db.commit()
+
+
+def _register_active_import(import_task_id: str) -> bool:
+    """Return False if another thread is already running this import."""
+    run_lock = _task_run_locks[import_task_id]
+    if not run_lock.acquire(blocking=False):
+        return False
+    with _active_import_lock:
+        _active_import_tasks.add(import_task_id)
+    return True
+
+
+def _unregister_active_import(import_task_id: str) -> None:
+    with _active_import_lock:
+        _active_import_tasks.discard(import_task_id)
+    _task_run_locks[import_task_id].release()
 
 _SKIP_FILENAMES: frozenset[str] = frozenset({
     ".ds_store", "thumbs.db", "desktop.ini", ".gitkeep", ".gitignore",
@@ -98,15 +142,29 @@ def _decode_zip_member_name(m: zipfile.ZipInfo) -> str:
     return m.filename
 
 
-def _extract_zip_to_storage(
-    storage: StorageBackend, zip_bytes: bytes, directory_id: str
+_EXTRACT_BATCH_SIZE = 50  # files per FTP session during unzip
+
+
+def _extract_zip_archive_from_path(
+    storage: StorageBackend, zip_path: Path, directory_id: str
 ) -> list[str]:
-    """Write zip members to ``raw_tree`` and return normalized relative paths (files only)."""
+    """Write zip members to ``raw_tree`` from an on-disk archive.
+
+    Uses ``put_bytes_batch`` so that all files in a batch share a single
+    FTP connection — critical for Docker where per-connection overhead is
+    30–100 ms (versus ~2 ms on localhost).
+    """
     base = f"/dataset/import/raw_tree/{directory_id}"
     storage.mkdir_p(base)
     extracted: list[str] = []
-    buf = io.BytesIO(zip_bytes)
-    with zipfile.ZipFile(buf, "r") as zf:
+    batch: list[tuple[str, bytes]] = []
+
+    def _flush(batch: list[tuple[str, bytes]]) -> None:
+        if batch:
+            storage.put_bytes_batch(batch)
+            batch.clear()
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
         for m in zf.infolist():
             if m.is_dir():
                 continue
@@ -121,8 +179,12 @@ def _extract_zip_to_storage(
             with zf.open(m, "r") as src:
                 data = src.read()
             rel = decoded_name.replace("\\", "/").lstrip("/")
-            storage.put_bytes(f"{base}/{rel}", data)
+            batch.append((f"{base}/{rel}", data))
             extracted.append(rel)
+            if len(batch) >= _EXTRACT_BATCH_SIZE:
+                _flush(batch)
+        _flush(batch)
+
     return extracted
 
 
@@ -209,6 +271,14 @@ def _merge_oct_fields_into_questionnaire_row(
 
 
 def run_import_task(storage: StorageBackend, import_task_id: str) -> None:
+    """
+    Runs import in a background thread. Uses an atomic claim so duplicate dispatches are safe,
+    and so poll-side lazy redispatch can retry when the first thread never started (uvicorn/FTP quirks).
+    """
+    if not _register_active_import(import_task_id):
+        logger.info("import worker skip %s (already running in this process)", import_task_id)
+        return
+
     from backend.app.db.session import get_session_factory
 
     factory = get_session_factory()
@@ -216,10 +286,62 @@ def run_import_task(storage: StorageBackend, import_task_id: str) -> None:
     try:
         task = db.get(DatasetImportTask, import_task_id)
         if not task:
+            logger.warning(
+                "import worker: task %s not in DB yet or deleted — usually a commit/thread ordering "
+                "race; client should retry polling.",
+                import_task_id,
+            )
             return
         directory = db.get(DatasetDirectory, task.directory_id)
         if not directory:
+            logger.warning(
+                "import worker: directory missing for task %s directory_id=%s",
+                import_task_id,
+                task.directory_id,
+            )
             return
+
+        db.execute(
+            update(DatasetImportTask)
+            .where(
+                DatasetImportTask.import_task_id == import_task_id,
+                DatasetImportTask.status == "IMPORTING",
+                DatasetImportTask.stage.in_(("QUEUED", "DISPATCHED")),
+                DatasetImportTask.progress.in_((0, 1)),
+            )
+            .values(progress=2, stage="WORKER_CLAIMED")
+        )
+        db.commit()
+        task = db.get(DatasetImportTask, import_task_id)
+        if not task or task.stage != "WORKER_CLAIMED" or task.progress != 2:
+            logger.info(
+                "import worker skip %s (already claimed or progressed; stage=%s progress=%s)",
+                import_task_id,
+                getattr(task, "stage", None),
+                getattr(task, "progress", None),
+            )
+            return
+
+        db.close()
+        db = factory()
+        task = db.get(DatasetImportTask, import_task_id)
+        if not task:
+            logger.warning("import worker post-claim task missing %s", import_task_id)
+            return
+        directory = db.get(DatasetDirectory, task.directory_id)
+        if not directory:
+            logger.warning(
+                "import worker post-claim directory missing task=%s directory_id=%s",
+                import_task_id,
+                task.directory_id,
+            )
+            return
+
+        logger.info(
+            "import TASK_DEQUEUED task=%s directory=%s",
+            import_task_id,
+            directory.directory_id,
+        )
         try:
             _run_import_core(db, storage, task, directory)
             db.commit()
@@ -231,6 +353,7 @@ def run_import_task(storage: StorageBackend, import_task_id: str) -> None:
             _fail_task(import_task_id, str(exc))
     finally:
         db.close()
+        _unregister_active_import(import_task_id)
 
 
 def _fail_task(import_task_id: str, message: str) -> None:
@@ -251,10 +374,7 @@ def _fail_task(import_task_id: str, message: str) -> None:
 
 
 def _run_import_core(db: Session, storage: StorageBackend, task: DatasetImportTask, directory: DatasetDirectory) -> None:
-    task.status = "IMPORTING"
-    task.progress = 5
-    task.stage = "READ_ZIP"
-    db.flush()
+    _commit_import_progress(db, task, progress=5, stage="READ_ZIP")
 
     if not directory.raw_zip_file_id:
         raise AppError("目录缺少源文件引用。", "DATASET_IMPORT_STRUCTURE_INVALID")
@@ -262,14 +382,59 @@ def _run_import_core(db: Session, storage: StorageBackend, task: DatasetImportTa
     if not merged:
         raise NotFoundError("上传文件不存在。")
 
-    zip_bytes = storage.get_bytes(merged.ftp_path)
-    storage.put_bytes(f"/dataset/import/raw_zip/{directory.directory_id}/source.zip", zip_bytes)
+    s = get_settings()
+    s.dataset_runtime_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(suffix=".zip", prefix="import-src-", dir=s.dataset_runtime_dir)
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    extracted_rels: list[str] = []
+    try:
+        _commit_import_progress(db, task, progress=8, stage="FETCH_SOURCE")
+        logger.info(
+            "import FETCH_SOURCE_START task=%s ftp_path=%s file_size=%s",
+            task.import_task_id,
+            merged.ftp_path,
+            merged.file_size,
+        )
+        merged_size = max(int(merged.file_size or 0), 1)
+        downloaded = 0
+        last_commit = time.monotonic()
 
-    task.progress = 15
-    task.stage = "UNZIP"
-    db.flush()
+        def _on_fetch_block(n: int) -> None:
+            nonlocal downloaded, last_commit
+            downloaded += n
+            now = time.monotonic()
+            if now - last_commit < _FETCH_PROGRESS_COMMIT_INTERVAL_S:
+                return
+            last_commit = now
+            pct = min(14, 8 + int(downloaded * 6 / merged_size))
+            _commit_import_progress(db, task, progress=pct, stage="FETCH_SOURCE")
 
-    extracted_rels = _extract_zip_to_storage(storage, zip_bytes, directory.directory_id)
+        storage.fetch_to_local(merged.ftp_path, tmp_path, block_callback=_on_fetch_block)
+        logger.info("import FETCH_SOURCE_DONE task=%s local=%s", task.import_task_id, tmp_path)
+
+        canonical_zip = f"/dataset/import/raw_zip/{directory.directory_id}/source.zip"
+        if int(merged.file_size or 0) >= _SKIP_RAW_ZIP_REUPLOAD_BYTES:
+            logger.info(
+                "import SKIP_RAW_ZIP_REUPLOAD task=%s size=%s use_merged_path=%s",
+                task.import_task_id,
+                merged.file_size,
+                merged.ftp_path,
+            )
+        elif not storage.exists(canonical_zip):
+            storage.put_file_from_path(canonical_zip, tmp_path)
+
+        _commit_import_progress(db, task, progress=15, stage="UNZIP")
+        logger.info("import UNZIP_START task=%s", task.import_task_id)
+
+        extracted_rels = _extract_zip_archive_from_path(storage, tmp_path, directory.directory_id)
+        logger.info("import UNZIP_DONE task=%s entries=%s", task.import_task_id, len(extracted_rels))
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     extracted_set = set(extracted_rels)
     raw_tree_base = _raw_tree_prefix(directory.directory_id)
 
@@ -393,8 +558,7 @@ def _run_import_core(db: Session, storage: StorageBackend, task: DatasetImportTa
 
     db.flush()
 
-    task.progress = 55
-    task.stage = "INDEX_IMAGES"
+    _commit_import_progress(db, task, progress=55, stage="INDEX_IMAGES")
     asset_count = 0
 
     def _register_oct_json_columns(oct_scalar: dict[str, Any]) -> None:
@@ -516,9 +680,21 @@ def _run_import_core(db: Session, storage: StorageBackend, task: DatasetImportTa
 
     db.flush()
 
+    # ── FDT + OCT DAT ──────────────────────────────────────────────────────────
+    # Commit progress counter so the poll heartbeat is visible and the MySQL
+    # connection does not go stale during long image-processing loops.
+    _IMAGE_COMMIT_EVERY = 20  # files processed per progress commit
+    _files_since_commit = 0
+
     for rel in sorted(extracted_rels):
         rel_lower = rel.lower()
         rel_norm = rel.replace("\\", "/")
+
+        _files_since_commit += 1
+        if _files_since_commit >= _IMAGE_COMMIT_EVERY:
+            _files_since_commit = 0
+            pct = min(89, 55 + int(asset_count * 34 / max(len(extracted_rels), 1)))
+            _commit_import_progress(db, task, progress=pct, stage="INDEX_IMAGES")
 
         if rel_lower.endswith(".fdt"):
             pid = _guess_pid_from_relative(rel, known_pids)
@@ -604,16 +780,23 @@ def _run_import_core(db: Session, storage: StorageBackend, task: DatasetImportTa
                     f"/dataset/import/parsed/{directory.directory_id}/oct_frames/{tag}/"
                     f"{Path(rel).stem}.frames"
                 )
-                storage.mkdir_p(frames_base)
+
+                # Collect frames in memory first, then flush via put_bytes_batch so
+                # that a 120-frame DAT uses ONE FTP connection instead of 120.
+                _frame_buffer: list[tuple[str, bytes]] = []
 
                 def _write_frame(name: str, data: bytes) -> None:
-                    storage.put_bytes(f"{frames_base}/{name}", data)
+                    _frame_buffer.append((f"{frames_base}/{name}", data))
 
                 oct_result = parse_oct_dat_bytes(
                     raw_dat,
                     write_frame=_write_frame,
                     source_path_for_meta=rel,
                 )
+
+                if _frame_buffer:
+                    storage.put_bytes_batch(_frame_buffer)
+
             except Exception as exc:  # noqa: BLE001
                 warning_count += 1
                 db.add(

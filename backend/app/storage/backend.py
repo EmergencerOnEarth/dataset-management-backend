@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import shutil
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from pathlib import Path
 
 from backend.app.core.config import Settings
@@ -26,6 +27,26 @@ class StorageBackend(ABC):
     @abstractmethod
     def get_bytes(self, remote_path: str) -> bytes:
         """Read full file."""
+
+    @abstractmethod
+    def fetch_to_local(
+        self,
+        remote_path: str,
+        local_path: Path,
+        *,
+        block_callback: Callable[[int], None] | None = None,
+    ) -> None:
+        """Stream remote file to ``local_path`` (overwrite); avoids loading multi‑GiB zips into RAM."""
+
+    @abstractmethod
+    def put_bytes_batch(self, items: list[tuple[str, bytes]]) -> None:
+        """Write many files in one transport session (critical for Docker FTP performance).
+
+        ``items`` is a list of ``(remote_path, data)`` pairs.  All paths may
+        span multiple directories; the implementation must create parents as
+        needed.  Order within the batch is preserved but not guaranteed to be
+        atomic.
+        """
 
     @abstractmethod
     def exists(self, remote_path: str) -> bool:
@@ -73,6 +94,30 @@ class LocalMirrorStorage(StorageBackend):
     def get_bytes(self, remote_path: str) -> bytes:
         return self._full(remote_path).read_bytes()
 
+    def fetch_to_local(
+        self,
+        remote_path: str,
+        local_path: Path,
+        *,
+        block_callback: Callable[[int], None] | None = None,
+    ) -> None:
+        src = self._full(remote_path)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        if block_callback is None:
+            shutil.copyfile(src, local_path)
+            return
+        with src.open("rb") as inp, local_path.open("wb") as out:
+            while True:
+                chunk = inp.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                block_callback(len(chunk))
+
+    def put_bytes_batch(self, items: list[tuple[str, bytes]]) -> None:
+        for remote_path, data in items:
+            self.put_bytes(remote_path, data)
+
     def exists(self, remote_path: str) -> bool:
         return self._full(remote_path).is_file()
 
@@ -118,7 +163,8 @@ class FtpStorage(StorageBackend):
 
     def _connect(self):
         ftp = self._ftplib.FTP()
-        ftp.connect(self._settings.ftp_host, self._settings.ftp_port, timeout=120)
+        # Large merged zips (multi‑GiB) need long RETR; 2h avoids abort mid-stream.
+        ftp.connect(self._settings.ftp_host, self._settings.ftp_port, timeout=7200)
         user = self._settings.ftp_user or "anonymous"
         passwd = self._settings.ftp_password or ""
         ftp.login(user, passwd)
@@ -202,6 +248,85 @@ class FtpStorage(StorageBackend):
             buf = io.BytesIO()
             ftp.retrbinary(f"RETR {name}", buf.write)
             return buf.getvalue()
+        finally:
+            ftp.quit()
+
+    def _prepare_ftp_transfer(self, ftp) -> None:
+        try:
+            ftp.encoding = "utf-8"
+            ftp.sendcmd("OPTS UTF8 ON")
+        except Exception:
+            pass
+        if ftp.sock is not None:
+            ftp.sock.settimeout(300)
+
+    def fetch_to_local(
+        self,
+        remote_path: str,
+        local_path: Path,
+        *,
+        block_callback: callable[[int], None] | None = None,
+    ) -> None:
+        rel = self._path_under_root(remote_path)
+        parent, _, name = rel.rpartition("/")
+        ftp = self._connect()
+        try:
+            self._prepare_ftp_transfer(ftp)
+            self._cwd_root(ftp)
+            if parent:
+                for seg in parent.split("/"):
+                    if not seg:
+                        continue
+                    ftp.cwd(seg)
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            with local_path.open("wb") as out:
+
+                def _writer(data: bytes) -> None:
+                    if ftp.sock is not None:
+                        ftp.sock.settimeout(300)
+                    out.write(data)
+                    if block_callback is not None:
+                        block_callback(len(data))
+
+                ftp.retrbinary(f"RETR {name}", _writer, blocksize=1024 * 1024)
+        finally:
+            ftp.quit()
+
+    def _ftp_cwd_mkdir(self, ftp, dir_rel: str) -> None:
+        """Navigate into ``dir_rel`` (relative to FTP root), creating dirs as needed."""
+        self._cwd_root(ftp)
+        for seg in dir_rel.split("/"):
+            if not seg:
+                continue
+            try:
+                ftp.cwd(seg)
+            except Exception:
+                ftp.mkd(seg)
+                ftp.cwd(seg)
+
+    def put_bytes_batch(self, items: list[tuple[str, bytes]]) -> None:
+        """Write all items in a single FTP session, grouping files by directory."""
+        if not items:
+            return
+        from itertools import groupby
+
+        # Group by parent directory so we minimise CWD calls.
+        def _parent(path: str) -> str:
+            rel = self._path_under_root(path)
+            return rel.rsplit("/", 1)[0] if "/" in rel else ""
+
+        sorted_items = sorted(items, key=lambda x: _parent(x[0]))
+        ftp = self._connect()
+        try:
+            current_dir: str | None = None
+            for remote_path, data in sorted_items:
+                rel = self._path_under_root(remote_path)
+                parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
+                fname = rel.rsplit("/", 1)[-1]
+                if parent != current_dir:
+                    self._ftp_cwd_mkdir(ftp, parent)
+                    current_dir = parent
+                ftp.storbinary(f"STOR {fname}", io.BytesIO(data))
         finally:
             ftp.quit()
 

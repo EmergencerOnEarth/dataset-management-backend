@@ -1,8 +1,8 @@
 """
-数据集 REST 路由，对照设计 §3.2：API-01～17。
+数据集 REST 路由，对照设计 §3.2：API-01～20。
 
 分块：导入配置 / 上传（instant-check～complete）/ 目录与导入任务 /
-动态浏览与影像 / 目录与患者导出 / 静态影像流 ``dataset-files``。
+动态浏览与影像 / 目录与患者导出 / 导出任务查询 / 静态影像流 ``dataset-files``。
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, Header, Query, Request, Response
 from pydantic import BaseModel, Field
@@ -274,6 +275,52 @@ def export_patient(
     db.commit()
     run_patient_export_after_commit(storage, payload["exportRecordId"])
     return ok(request, payload)
+
+
+@router.get("/dataset-exports")
+def list_exports(
+    request: Request,
+    db: DbSession,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, ge=1, le=100),
+    exportType: Optional[str] = Query(default=None),
+    exportStatus: Optional[str] = Query(default=None),
+    createdAtStart: Optional[str] = Query(default=None),
+    createdAtEnd: Optional[str] = Query(default=None),
+):
+    return ok(
+        request,
+        directory_service.list_exports(
+            db,
+            offset=offset,
+            limit=limit,
+            export_type=exportType,
+            export_status=exportStatus,
+            created_at_start=createdAtStart,
+            created_at_end=createdAtEnd,
+        ),
+    )
+
+
+@router.get("/dataset-exports/{export_record_id}")
+def get_export_detail(request: Request, db: DbSession, export_record_id: str):
+    return ok(request, directory_service.get_export_detail(db, export_record_id))
+
+
+@router.get("/dataset-exports/{export_record_id}/download")
+def download_export(
+    export_record_id: str,
+    db: DbSession,
+    storage: StorageDep,
+):
+    file_name, ftp_path = directory_service.get_export_download(db, export_record_id)
+    body = storage.get_bytes(ftp_path)
+    ascii_name = file_name.encode("ascii", "ignore").decode() or "export.zip"
+    encoded_name = quote(file_name)
+    headers = {
+        "Content-Disposition": f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}',
+    }
+    return Response(content=body, media_type="application/zip", headers=headers)
 
 
 def _parsed_jpeg_logical_path(img: DatasetImageAsset) -> str:

@@ -82,3 +82,7 @@ env APP_HOST=127.0.0.1 APP_PORT=8091 .venv/bin/python scripts/run_mock_api.py
 - `.env.example` 是可提交的配置模板。
 - `.secrets/local.env` 保存本地 GitHub、测试服务器、数据库、FTP 等敏感信息，已被 `.gitignore` 排除。
 - `test-data/` 和 `docs/references/` 体量较大，默认不提交到 Git。
+
+## 本机磁盘与 `.runtime` 清理
+
+联调与集成测试会在仓库根目录 `.runtime/`（默认 `DATASET_RUNTIME_DIR`）积累上传分片、合并 zip、解压与解析产物等，体量可达数十 GB；**与** `test-data/` 下的大样例包相互独立。腾空间前应先停止本机 API / 本地 FTP（常见端口 8092、2121），再删除 `.runtime`。详细命令与工作区与测试服务器的区分见工作区内运维手册 **`docs/ops/部署与运维手册_正式版_20260513.md` 附录 A**（版本 V1.1.2+）；清理操作记录见 **`docs/work-logs/2026-05-12_数据集管理新视野正式版三轮验收修复与部署文档整理.md`** §11.7。

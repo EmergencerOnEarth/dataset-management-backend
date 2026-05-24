@@ -1,0 +1,29 @@
+# 本地 Docker 联调：API 在容器内，MySQL / FTP 在宿主机。
+#
+# 1. 宿主机启动 MySQL（库 eye_research_dataset）与 FTP（须监听 0.0.0.0，以便容器经主机网关访问）：
+#    python3 scripts/run_local_ftp_server.py --host 0.0.0.0 --port 2121
+# 2. cp docker.local.env.example docker.local.env   # 按本机修改口令等
+# 3. docker compose build && docker compose up -d
+# 4. curl http://127.0.0.1:8091/health
+#
+# Linux 若 MySQL 仅监听 127.0.0.1，容器连 host.docker.internal 可能失败，可为 mysqld 配置 bind-address=0.0.0.0
+# 或改用 network_mode: host（此时映射端口需改为直接使用 APP_PORT）。
+services:
+  dataset-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: eye-research-dataset-backend:local
+    container_name: eye-dataset-api
+    ports:
+      - "8091:8091"
+    env_file:
+      - docker.local.env
+    volumes:
+      - dataset-runtime:/app/.runtime
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  dataset-runtime:

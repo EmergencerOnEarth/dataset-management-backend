@@ -71,6 +71,7 @@ def _upload_zip(client: TestClient, content: bytes, filename: str) -> dict:
                 "fileSize": n,
                 "fileHash": fh,
                 "chunkSize": 4 * 1024 * 1024,
+                "businessType": "DATASET_IMPORT",
             },
         )
     )
@@ -732,3 +733,32 @@ def test_T08_original_url_is_api_endpoint(client: TestClient, imported_directory
         assert url.startswith("/api/v1/dataset-files/"), (
             f"originalUrl should be controlled API path, got: {url}"
         )
+
+
+def test_T08_frame_url_and_frame_file_endpoint(client: TestClient, imported_directory):
+    """OCT DAT 返回 frameUrl 基底；前端拼接 frame_*.png 可逐帧访问。"""
+    did = imported_directory["directoryId"]
+    images_data = _resp(
+        client.get(
+            f"/api/v1/dataset-directories/{did}/patients/INT_PT_001/images",
+            params={"surveyDate": "2026-05-08"},
+        )
+    )
+    records = images_data.get("records") or []
+    oct_with_frames = [r for r in records if r.get("frameUrl")]
+    assert oct_with_frames, f"Expected OCT DAT frameUrl in records: {records}"
+
+    img = oct_with_frames[0]
+    image_id = img["imageId"]
+    assert img["frameUrl"] == f"/api/v1/dataset-files/{image_id}/frame/"
+
+    detail = _resp(
+        client.get(
+            f"/api/v1/dataset-directories/{did}/patients/INT_PT_001/images/{image_id}"
+        )
+    )
+    assert detail["frameUrl"] == img["frameUrl"]
+
+    frame_resp = client.get(f"{img['frameUrl']}frame_00000.png")
+    assert frame_resp.status_code == 200, frame_resp.text
+    assert frame_resp.headers.get("content-type", "").startswith("image/png")

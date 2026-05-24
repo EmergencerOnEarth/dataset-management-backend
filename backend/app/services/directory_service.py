@@ -20,11 +20,23 @@ from backend.app.db.models import (
     DatasetQuestionnaireRecord,
     ExportRecord,
 )
+from backend.app.storage.backend import StorageBackend
 from backend.app.util.ids import new_id
 
 
 def _now_str() -> str:
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _frame_url(img: DatasetImageAsset) -> str | None:
+    """OCT DAT 多帧基底 URL；前端拼接 ``metadata.octDat.frames`` 中的 PNG 文件名。"""
+    parsed = getattr(img, "parsed_path", None)
+    if not parsed:
+        return None
+    norm = str(parsed).replace("\\", "/")
+    if ".frames/" in norm or norm.rsplit("/", 1)[-1].startswith("frame_"):
+        return f"/api/v1/dataset-files/{img.image_id}/frame/"
+    return None
 
 
 def _perm_flags(row: DatasetDirectory) -> dict[str, bool]:
@@ -127,10 +139,34 @@ def create_directory(
     }
 
 
-def get_import_task(db: Session, import_task_id: str) -> dict[str, Any]:
+def get_import_task(
+    db: Session,
+    import_task_id: str,
+    *,
+    storage: StorageBackend | None = None,
+) -> dict[str, Any]:
     task = db.get(DatasetImportTask, import_task_id)
     if not task:
         raise NotFoundError("导入任务不存在。")
+    if storage is not None and task.status == "IMPORTING" and task.created_at is not None:
+        created = task.created_at
+        if getattr(created, "tzinfo", None):
+            created = created.replace(tzinfo=None)
+        age_s = (dt.datetime.now() - created).total_seconds()
+        from backend.app.services.import_pipeline import is_import_task_active
+
+        needs_redispatch = (
+            task.stage in ("QUEUED", "DISPATCHED") and task.progress < 5 and age_s >= 3
+        ) or (
+            task.stage in ("WORKER_CLAIMED", "READ_ZIP", "FETCH_SOURCE")
+            and task.progress < 15
+            and age_s >= 180
+            and not is_import_task_active(import_task_id)
+        )
+        if needs_redispatch:
+            from backend.app.workers.async_dispatch import maybe_lazy_redispatch_import
+
+            maybe_lazy_redispatch_import(storage, import_task_id)
     return {
         "directoryId": task.directory_id,
         "importTaskId": task.import_task_id,
@@ -368,6 +404,7 @@ def patient_images(
                 "sourceType": i.source_type,
                 "thumbnailUrl": i.thumbnail_path,
                 "previewUrl": i.preview_path,
+                "frameUrl": _frame_url(i),
                 "originalUrl": f"/api/v1/dataset-files/{i.image_id}/original",
                 "createdAt": i.created_at.strftime("%Y-%m-%d %H:%M:%S") if i.created_at else None,
                 "metadata": {},
@@ -390,6 +427,7 @@ def image_detail(db: Session, directory_id: str, patient_id: str, image_id: str)
     return {
         "imageId": img.image_id,
         "previewUrl": img.preview_path,
+        "frameUrl": _frame_url(img),
         "originalUrl": f"/api/v1/dataset-files/{img.image_id}/original",
         "metadata": meta_json,
         "sequence": {"current": 1, "total": 1, "sameDateImageIds": [img.image_id]},
@@ -490,3 +528,195 @@ def create_patient_export(
         "fileName": file_name,
         "expireAt": expire.strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+
+_EXPORT_TYPE_NAMES = {
+    "DATASET_DIRECTORY": "数据目录导出",
+    "DATASET_PATIENT": "患者数据导出",
+}
+
+_EXPORT_STATUS_NAMES = {
+    "PREPARING": "打包中",
+    "DONE": "可下载",
+    "FAILED": "导出失败",
+    "EXPIRED": "已过期",
+}
+
+
+def _utcnow() -> dt.datetime:
+    return dt.datetime.utcnow()
+
+
+def _format_dt(value: dt.datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _effective_export_status(rec: ExportRecord, *, now: dt.datetime | None = None) -> str:
+    now = now or _utcnow()
+    if rec.export_status == "DONE" and rec.expire_at < now:
+        return "EXPIRED"
+    return rec.export_status
+
+
+def _is_export_downloadable(rec: ExportRecord, *, now: dt.datetime | None = None) -> bool:
+    return _effective_export_status(rec, now=now) == "DONE" and bool(rec.ftp_path)
+
+
+def _export_download_url(export_record_id: str, rec: ExportRecord, *, now: dt.datetime | None = None) -> str | None:
+    if _is_export_downloadable(rec, now=now):
+        return f"/api/v1/dataset-exports/{export_record_id}/download"
+    return None
+
+
+def _export_summary(rec: ExportRecord) -> dict[str, Any]:
+    payload = rec.payload_json or {}
+    if rec.export_type == "DATASET_DIRECTORY":
+        ids = payload.get("directoryIds") or []
+        return {"directoryIds": ids, "directoryCount": len(ids)}
+    if rec.export_type == "DATASET_PATIENT":
+        opts = payload.get("options") or {}
+        return {
+            "directoryId": payload.get("directoryId"),
+            "patientId": payload.get("patientId"),
+            "surveyDates": opts.get("surveyDates"),
+        }
+    return {}
+
+
+def _export_payload(rec: ExportRecord) -> dict[str, Any]:
+    payload = rec.payload_json or {}
+    if rec.export_type == "DATASET_DIRECTORY":
+        opts = payload.get("options") or {}
+        return {
+            "directoryIds": payload.get("directoryIds") or [],
+            "includeOriginalTable": opts.get("includeOriginalTable"),
+            "includeMergedTable": opts.get("includeMergedTable"),
+            "includeParsedImages": opts.get("includeParsedImages"),
+            "includeOriginalAttachments": opts.get("includeOriginalAttachments"),
+        }
+    if rec.export_type == "DATASET_PATIENT":
+        opts = payload.get("options") or {}
+        out: dict[str, Any] = {
+            "directoryId": payload.get("directoryId"),
+            "patientId": payload.get("patientId"),
+        }
+        if opts.get("surveyDates") is not None:
+            out["surveyDates"] = opts.get("surveyDates")
+        return out
+    return dict(payload)
+
+
+def _serialize_export_record(rec: ExportRecord, *, now: dt.datetime | None = None) -> dict[str, Any]:
+    now = now or _utcnow()
+    status = _effective_export_status(rec, now=now)
+    return {
+        "exportRecordId": rec.export_record_id,
+        "exportType": rec.export_type,
+        "exportTypeName": _EXPORT_TYPE_NAMES.get(rec.export_type, rec.export_type),
+        "exportStatus": status,
+        "exportStatusName": _EXPORT_STATUS_NAMES.get(status, status),
+        "fileName": rec.file_name,
+        "createdAt": _format_dt(rec.created_at),
+        "finishedAt": None,
+        "expireAt": _format_dt(rec.expire_at),
+        "downloadable": _is_export_downloadable(rec, now=now),
+        "downloadUrl": _export_download_url(rec.export_record_id, rec, now=now),
+        "failureReason": rec.failure_reason,
+        "summary": _export_summary(rec),
+    }
+
+
+def _serialize_export_detail(rec: ExportRecord, *, now: dt.datetime | None = None) -> dict[str, Any]:
+    now = now or _utcnow()
+    status = _effective_export_status(rec, now=now)
+    return {
+        "exportRecordId": rec.export_record_id,
+        "exportType": rec.export_type,
+        "exportStatus": status,
+        "fileName": rec.file_name,
+        "createdAt": _format_dt(rec.created_at),
+        "finishedAt": None,
+        "expireAt": _format_dt(rec.expire_at),
+        "downloadable": _is_export_downloadable(rec, now=now),
+        "downloadUrl": _export_download_url(rec.export_record_id, rec, now=now),
+        "failureReason": rec.failure_reason,
+        "payload": _export_payload(rec),
+    }
+
+
+def list_exports(
+    db: Session,
+    *,
+    offset: int,
+    limit: int,
+    export_type: str | None,
+    export_status: str | None,
+    created_at_start: str | None,
+    created_at_end: str | None,
+) -> dict[str, Any]:
+    if offset < 0:
+        raise AppError("offset 不能小于 0。", "DATASET_VALIDATION_ERROR", code=42201, status_code=422)
+    if limit < 1 or limit > 100:
+        raise AppError("limit 须在 1～100 之间。", "DATASET_VALIDATION_ERROR", code=42201, status_code=422)
+
+    now = _utcnow()
+    filters: list[Any] = []
+    if export_type:
+        filters.append(ExportRecord.export_type == export_type)
+    if created_at_start:
+        filters.append(ExportRecord.created_at >= created_at_start)
+    if created_at_end:
+        filters.append(ExportRecord.created_at <= created_at_end + " 23:59:59")
+
+    if export_status == "EXPIRED":
+        filters.extend(
+            [
+                ExportRecord.export_status == "DONE",
+                ExportRecord.expire_at < now,
+            ]
+        )
+    elif export_status == "DONE":
+        filters.extend(
+            [
+                ExportRecord.export_status == "DONE",
+                ExportRecord.expire_at >= now,
+            ]
+        )
+    elif export_status:
+        filters.append(ExportRecord.export_status == export_status)
+
+    count_stmt = select(func.count()).select_from(ExportRecord)
+    if filters:
+        count_stmt = count_stmt.where(*filters)
+    total = db.scalar(count_stmt) or 0
+
+    list_stmt = select(ExportRecord).order_by(ExportRecord.created_at.desc())
+    if filters:
+        list_stmt = list_stmt.where(*filters)
+    rows = db.execute(list_stmt.offset(offset).limit(limit)).scalars().all()
+    return {
+        "records": [_serialize_export_record(r, now=now) for r in rows],
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+    }
+
+
+def get_export_detail(db: Session, export_record_id: str) -> dict[str, Any]:
+    rec = db.get(ExportRecord, export_record_id)
+    if not rec:
+        raise NotFoundError("导出任务不存在。")
+    return _serialize_export_detail(rec)
+
+
+def get_export_download(db: Session, export_record_id: str) -> tuple[str, bytes]:
+    rec = db.get(ExportRecord, export_record_id)
+    if not rec:
+        raise NotFoundError("导出任务不存在。")
+    if not _is_export_downloadable(rec):
+        raise AppError("导出文件不可下载。", "DATASET_EXPORT_NOT_DOWNLOADABLE", code=40301, status_code=403)
+    if not rec.ftp_path:
+        raise AppError("导出文件不可下载。", "DATASET_EXPORT_NOT_DOWNLOADABLE", code=40301, status_code=403)
+    return rec.file_name, rec.ftp_path
