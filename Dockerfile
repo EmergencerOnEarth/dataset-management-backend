@@ -5,10 +5,6 @@ FROM ${PY_IMAGE}
 
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY pyproject.toml ./
 COPY backend ./backend
 COPY static ./static
@@ -26,6 +22,6 @@ USER app
 EXPOSE 8091
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8091/health >/dev/null || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/health', timeout=5).read()" || exit 1
 
 CMD ["python", "-m", "uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8091"]
