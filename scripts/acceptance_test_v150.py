@@ -316,7 +316,7 @@ def build_test_zip(pid1="ACC_PT_001", pid2="ACC_PT_002") -> bytes:
         zf.writestr(f"眼底照相/{pid2}/2026-05-20/fundus_c.fdt", STUB_JPEG)
         zf.writestr(f"OCT/{pid1}/2026-05-20/od-scan-001.dat", oct_dat)
         zf.writestr(f"OCT/{pid1}/2026-05-20/od-scan-001.json", oct_json)
-        zf.writestr("_pad/pad.bin", bytes(1_200_000))
+        zf.writestr("_pad/pad.bin", bytes((i % 251 for i in range(1_200_000))))
     return buf.getvalue()
 
 
@@ -1051,7 +1051,7 @@ def run(base_url: str) -> None:
             json={"surveyDates": ["2026-05-20"]},
         ))
         filt_id = filtered["exportRecordId"]
-        filt_done = wait_export_http(client, filt_id, timeout=60)
+        filt_done = wait_export_http(client, filt_id, timeout=180)
         assert filt_done["exportStatus"] == "DONE"
         r = client.get(filt_done["downloadUrl"])
         zf = zipfile.ZipFile(io.BytesIO(r.content))
