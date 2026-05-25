@@ -6,9 +6,10 @@ import datetime as dt
 import threading
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session
 
+from backend.app.core.config import get_settings
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.db.models import (
     DatasetDirectory,
@@ -453,7 +454,7 @@ def create_directory_export(
     export_id = new_id("exp")
     joined = "-".join(ids[:3])
     file_name = f"{joined}-{dt.datetime.now().strftime('%Y%m%d%H%M%S')}.zip"
-    expire = dt.datetime.utcnow() + dt.timedelta(days=7)
+    expire = dt.datetime.utcnow() + dt.timedelta(days=get_settings().dataset_export_retention_days)
     rec = ExportRecord(
         export_record_id=export_id,
         export_type="DATASET_DIRECTORY",
@@ -509,7 +510,7 @@ def create_patient_export(
 
     export_id = new_id("exp")
     file_name = f"患者数据导出-{patient_id}-{dt.datetime.now().strftime('%Y%m%d%H%M%S')}.zip"
-    expire = dt.datetime.utcnow() + dt.timedelta(days=7)
+    expire = dt.datetime.utcnow() + dt.timedelta(days=get_settings().dataset_export_retention_days)
     rec = ExportRecord(
         export_record_id=export_id,
         export_type="DATASET_PATIENT",
@@ -554,6 +555,8 @@ def _format_dt(value: dt.datetime | None) -> str | None:
 
 
 def _effective_export_status(rec: ExportRecord, *, now: dt.datetime | None = None) -> str:
+    if rec.export_status == "EXPIRED":
+        return "EXPIRED"
     now = now or _utcnow()
     if rec.export_status == "DONE" and rec.expire_at < now:
         return "EXPIRED"
@@ -621,6 +624,7 @@ def _serialize_export_record(rec: ExportRecord, *, now: dt.datetime | None = Non
         "createdAt": _format_dt(rec.created_at),
         "finishedAt": None,
         "expireAt": _format_dt(rec.expire_at),
+        "downloadCount": rec.download_count or 0,
         "downloadable": _is_export_downloadable(rec, now=now),
         "downloadUrl": _export_download_url(rec.export_record_id, rec, now=now),
         "failureReason": rec.failure_reason,
@@ -639,6 +643,7 @@ def _serialize_export_detail(rec: ExportRecord, *, now: dt.datetime | None = Non
         "createdAt": _format_dt(rec.created_at),
         "finishedAt": None,
         "expireAt": _format_dt(rec.expire_at),
+        "downloadCount": rec.download_count or 0,
         "downloadable": _is_export_downloadable(rec, now=now),
         "downloadUrl": _export_download_url(rec.export_record_id, rec, now=now),
         "failureReason": rec.failure_reason,
@@ -671,11 +676,11 @@ def list_exports(
         filters.append(ExportRecord.created_at <= created_at_end + " 23:59:59")
 
     if export_status == "EXPIRED":
-        filters.extend(
-            [
-                ExportRecord.export_status == "DONE",
-                ExportRecord.expire_at < now,
-            ]
+        filters.append(
+            or_(
+                ExportRecord.export_status == "EXPIRED",
+                and_(ExportRecord.export_status == "DONE", ExportRecord.expire_at < now),
+            )
         )
     elif export_status == "DONE":
         filters.extend(
@@ -711,12 +716,70 @@ def get_export_detail(db: Session, export_record_id: str) -> dict[str, Any]:
     return _serialize_export_detail(rec)
 
 
-def get_export_download(db: Session, export_record_id: str) -> tuple[str, bytes]:
+def count_pending_downloads(db: Session, *, export_type: str | None = None) -> dict[str, Any]:
+    now = _utcnow()
+    filters: list[Any] = [
+        ExportRecord.export_status == "DONE",
+        ExportRecord.expire_at >= now,
+        ExportRecord.download_count == 0,
+        ExportRecord.ftp_path.is_not(None),
+    ]
+    if export_type:
+        filters.append(ExportRecord.export_type == export_type)
+
+    count_stmt = select(func.count()).select_from(ExportRecord).where(*filters)
+    pending = db.scalar(count_stmt) or 0
+    return {
+        "pendingDownloadCount": pending,
+        "retentionDays": get_settings().dataset_export_retention_days,
+        "generatedAt": _format_dt(now),
+    }
+
+
+def get_export_download(
+    db: Session, storage: StorageBackend, export_record_id: str
+) -> tuple[str, str]:
     rec = db.get(ExportRecord, export_record_id)
     if not rec:
         raise NotFoundError("导出任务不存在。")
-    if not _is_export_downloadable(rec):
-        raise AppError("导出文件不可下载。", "DATASET_EXPORT_NOT_DOWNLOADABLE", code=40301, status_code=403)
-    if not rec.ftp_path:
-        raise AppError("导出文件不可下载。", "DATASET_EXPORT_NOT_DOWNLOADABLE", code=40301, status_code=403)
+    now = _utcnow()
+    if rec.export_status == "EXPIRED" or (rec.export_status == "DONE" and rec.expire_at < now):
+        raise AppError(
+            "导出文件已过期。",
+            "DATASET_EXPORT_EXPIRED",
+            code=41001,
+            status_code=410,
+        )
+    if rec.export_status != "DONE" or not rec.ftp_path:
+        raise AppError(
+            "导出文件不可下载。",
+            "DATASET_EXPORT_NOT_DOWNLOADABLE",
+            code=40301,
+            status_code=403,
+        )
+    if not storage.exists(rec.ftp_path):
+        raise AppError(
+            "导出文件不可下载。",
+            "DATASET_EXPORT_NOT_DOWNLOADABLE",
+            code=40301,
+            status_code=403,
+        )
+
+    updated = db.execute(
+        update(ExportRecord)
+        .where(
+            ExportRecord.export_record_id == export_record_id,
+            ExportRecord.export_status == "DONE",
+            ExportRecord.expire_at >= now,
+            ExportRecord.ftp_path.is_not(None),
+        )
+        .values(download_count=ExportRecord.download_count + 1)
+    )
+    if updated.rowcount == 0:
+        raise AppError(
+            "导出文件不可下载。",
+            "DATASET_EXPORT_NOT_DOWNLOADABLE",
+            code=40301,
+            status_code=403,
+        )
     return rec.file_name, rec.ftp_path

@@ -706,6 +706,8 @@ def test_export_list_detail_and_download(client: TestClient):
         assert rec["exportTypeName"]
         assert rec["exportStatusName"]
         assert "downloadable" in rec
+        assert "downloadCount" in rec
+        assert rec["downloadCount"] == 0
         assert "summary" in rec
         assert "ftp" not in (rec.get("downloadUrl") or "").lower()
 
@@ -750,15 +752,89 @@ def test_export_list_detail_and_download(client: TestClient):
 
     done_detail = data(client.get(f"/api/v1/dataset-exports/{done_id}"))
     assert done_detail["exportStatus"] == "DONE"
+    assert done_detail["downloadCount"] == 0
     assert done_detail["downloadable"] is True
     assert done_detail["downloadUrl"] == f"/api/v1/dataset-exports/{done_id}/download"
     assert "ftp" not in done_detail["downloadUrl"].lower()
+
+    pending = data(client.get("/api/v1/dataset-exports/pending-download-count"))
+    assert pending["pendingDownloadCount"] >= 1
+    assert pending["retentionDays"] >= 1
+    assert pending["generatedAt"]
 
     dl = client.get(done_detail["downloadUrl"])
     assert dl.status_code == 200
     assert dl.headers.get("content-type", "").startswith("application/zip")
     assert zipfile.is_zipfile(io.BytesIO(dl.content))
 
+    after_one = data(client.get(f"/api/v1/dataset-exports/{done_id}"))
+    assert after_one["downloadCount"] == 1
+    pending_after = data(client.get("/api/v1/dataset-exports/pending-download-count"))
+    assert pending_after["pendingDownloadCount"] == pending["pendingDownloadCount"] - 1
+
+    dl2 = client.get(done_detail["downloadUrl"])
+    assert dl2.status_code == 200
+    after_two = data(client.get(f"/api/v1/dataset-exports/{done_id}"))
+    assert after_two["downloadCount"] == 2
+
+
+def test_export_expiry_sweep(client: TestClient):
+    """API-21 / 过期清理：backdate + sweep 后不可下载且状态 EXPIRED。"""
+    import datetime as dt
+
+    from backend.app.core.config import get_settings
+    from backend.app.db.models import ExportRecord
+    from backend.app.db.session import get_session_factory
+    from backend.app.storage.backend import get_storage
+    from backend.app.workers.export_expiry import sweep_expired_exports
+
+    content = _minimal_zip_with_xlsx()
+    task, _tid = _flow_upload_import(client, content, "过期清理测")
+    did = task["directoryId"]
+    exp = data(
+        client.post(
+            "/api/v1/dataset-directories/export",
+            json={"directoryIds": [did], "includeParsedImages": True},
+        )
+    )
+    export_id = exp["exportRecordId"]
+    for _ in range(180):
+        fac = get_session_factory()
+        db = fac()
+        try:
+            er = db.get(ExportRecord, export_id)
+            if er and er.export_status in ("DONE", "FAILED"):
+                assert er.export_status == "DONE", (er.export_status, er.failure_reason)
+                break
+        finally:
+            db.close()
+        time.sleep(0.05)
+
+    fac = get_session_factory()
+    db = fac()
+    try:
+        rec = db.get(ExportRecord, export_id)
+        assert rec and rec.ftp_path
+        ftp_path = rec.ftp_path
+        rec.expire_at = dt.datetime.utcnow() - dt.timedelta(minutes=1)
+        db.commit()
+    finally:
+        db.close()
+
+    storage = get_storage(get_settings())
+    cleaned = sweep_expired_exports(storage)
+    assert cleaned >= 1
+
+    detail = data(client.get(f"/api/v1/dataset-exports/{export_id}"))
+    assert detail["exportStatus"] == "EXPIRED"
+    assert detail["downloadable"] is False
+    assert detail["downloadUrl"] is None
+
+    expired_dl = client.get(f"/api/v1/dataset-exports/{export_id}/download")
+    assert expired_dl.status_code == 410
+    body = expired_dl.json()
+    assert body.get("errorCode") == "DATASET_EXPORT_EXPIRED"
+    assert not storage.exists(ftp_path)
 
 def _flow_upload_import(client: TestClient, content: bytes, directory_name: str, *, complete_extra: dict | None = None) -> tuple[dict, str]:
     fh = hashlib.sha256(content).hexdigest()

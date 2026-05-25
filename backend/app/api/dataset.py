@@ -1,5 +1,5 @@
 """
-数据集 REST 路由，对照设计 §3.2：API-01～20。
+数据集 REST 路由，对照设计 §3.2：API-01～21。
 
 分块：导入配置 / 上传（instant-check～complete）/ 目录与导入任务 /
 动态浏览与影像 / 目录与患者导出 / 导出任务查询 / 静态影像流 ``dataset-files``。
@@ -277,6 +277,15 @@ def export_patient(
     return ok(request, payload)
 
 
+@router.get("/dataset-exports/pending-download-count")
+def pending_download_count(
+    request: Request,
+    db: DbSession,
+    exportType: Optional[str] = Query(default=None),
+):
+    return ok(request, directory_service.count_pending_downloads(db, export_type=exportType))
+
+
 @router.get("/dataset-exports")
 def list_exports(
     request: Request,
@@ -302,18 +311,13 @@ def list_exports(
     )
 
 
-@router.get("/dataset-exports/{export_record_id}")
-def get_export_detail(request: Request, db: DbSession, export_record_id: str):
-    return ok(request, directory_service.get_export_detail(db, export_record_id))
-
-
 @router.get("/dataset-exports/{export_record_id}/download")
 def download_export(
     export_record_id: str,
     db: DbSession,
     storage: StorageDep,
 ):
-    file_name, ftp_path = directory_service.get_export_download(db, export_record_id)
+    file_name, ftp_path = directory_service.get_export_download(db, storage, export_record_id)
     body = storage.get_bytes(ftp_path)
     ascii_name = file_name.encode("ascii", "ignore").decode() or "export.zip"
     encoded_name = quote(file_name)
@@ -321,6 +325,11 @@ def download_export(
         "Content-Disposition": f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}',
     }
     return Response(content=body, media_type="application/zip", headers=headers)
+
+
+@router.get("/dataset-exports/{export_record_id}")
+def get_export_detail(request: Request, db: DbSession, export_record_id: str):
+    return ok(request, directory_service.get_export_detail(db, export_record_id))
 
 
 def _parsed_jpeg_logical_path(img: DatasetImageAsset) -> str:

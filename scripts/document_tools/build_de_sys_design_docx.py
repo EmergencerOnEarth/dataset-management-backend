@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import argparse
 import tempfile
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = Path("/Users/huangyining/Desktop/workspace/DE_sys")
 MD = ROOT / "docs/design/数据集管理设计文档_V0.3.0_20260513.md"
 DOCX = ROOT / "docs/design/数据集管理设计文档_V0.3.0_20260513.docx"
+VERSION_LABEL = "V0.3.1"
 DIAGRAM_DIR = Path("/private/tmp/de_sys_docx_diagrams")
 DIAGRAM_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -355,7 +357,7 @@ def add_table(doc: Document, rows: list[list[str]]):
     doc.add_paragraph()
 
 
-def build_docx():
+def build_docx(md_path: Path = MD, docx_path: Path = DOCX, version_label: str = VERSION_LABEL):
     doc = Document()
     section = doc.sections[0]
     section.page_width = Inches(8.5)
@@ -392,11 +394,11 @@ def build_docx():
 
     footer = section.footer.paragraphs[0]
     footer.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    run = footer.add_run("数据集管理设计文档 V0.3.1")
+    run = footer.add_run(f"数据集管理设计文档 {version_label}")
     set_font(run, size=8)
     run.font.color.rgb = RGBColor(100, 116, 139)
 
-    lines = MD.read_text(encoding="utf-8").splitlines()
+    lines = md_path.read_text(encoding="utf-8").splitlines()
     i = 0
     in_code = False
     code_lang = ""
@@ -497,9 +499,14 @@ def build_docx():
         add_inline_markdown(p, stripped, 10.5)
         i += 1
 
-    doc.save(DOCX)
-    print(DOCX)
+    doc.save(docx_path)
+    print(docx_path)
 
 
 if __name__ == "__main__":
-    build_docx()
+    parser = argparse.ArgumentParser(description="Build DE_sys design DOCX from Markdown.")
+    parser.add_argument("--input", type=Path, default=MD, help="Markdown source path")
+    parser.add_argument("--output", type=Path, default=DOCX, help="DOCX output path")
+    parser.add_argument("--version-label", default=VERSION_LABEL, help="Footer version label")
+    args = parser.parse_args()
+    build_docx(args.input, args.output, args.version_label)

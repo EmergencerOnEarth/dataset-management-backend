@@ -16,6 +16,7 @@ from backend.app.core.errors import AppError
 from backend.app.core.responses import error_response
 from backend.app.db.session import init_db
 from backend.app.services.seed_demo import ensure_demo_seed
+from backend.app.workers.export_expiry import sweep_expired_exports
 from backend.app.workers.import_recovery import recover_stalled_import_tasks_on_startup
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -41,19 +42,40 @@ async def _import_recovery_loop() -> None:
             _logger.exception("periodic import recovery failed")
 
 
+async def _export_expiry_loop() -> None:
+    interval = float(settings.dataset_export_expiry_sweep_interval_seconds)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(sweep_expired_exports)
+        except Exception:
+            _logger.exception("periodic export expiry sweep failed")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     """Create schema on startup; demo seed is idempotent."""
     init_db()
     ensure_demo_seed()
     recover_stalled_import_tasks_on_startup()
+    if settings.dataset_export_expiry_startup_sweep:
+        try:
+            sweep_expired_exports()
+        except Exception:
+            _logger.exception("startup export expiry sweep failed")
     recovery_task = asyncio.create_task(_import_recovery_loop())
+    expiry_task = asyncio.create_task(_export_expiry_loop())
     try:
         yield
     finally:
         recovery_task.cancel()
+        expiry_task.cancel()
         try:
             await recovery_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await expiry_task
         except asyncio.CancelledError:
             pass
 

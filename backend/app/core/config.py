@@ -43,6 +43,20 @@ class Settings(BaseSettings):
     ftp_password: str = Field(default="", alias="FTP_PASSWORD")
     ftp_root: str = Field(default="/dataset", alias="FTP_ROOT")
 
+    dataset_export_retention_days: int = Field(default=7, alias="DATASET_EXPORT_RETENTION_DAYS")
+    dataset_export_expiry_sweep_interval_seconds: int = Field(
+        default=3600,
+        alias="DATASET_EXPORT_EXPIRY_SWEEP_INTERVAL_SECONDS",
+    )
+    dataset_export_expiry_batch_size: int = Field(
+        default=100,
+        alias="DATASET_EXPORT_EXPIRY_BATCH_SIZE",
+    )
+    dataset_export_expiry_startup_sweep: bool = Field(
+        default=True,
+        alias="DATASET_EXPORT_EXPIRY_STARTUP_SWEEP",
+    )
+
     model_config = SettingsConfigDict(
         env_file=(".env", ".secrets/local.env"),
         env_file_encoding="utf-8",
