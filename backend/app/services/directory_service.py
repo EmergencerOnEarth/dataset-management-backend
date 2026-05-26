@@ -435,6 +435,13 @@ def image_detail(db: Session, directory_id: str, patient_id: str, image_id: str)
     }
 
 
+def _directory_export_file_name(ids: list[str], dirs: list[DatasetDirectory]) -> str:
+    """目录导出 zip 名：勾选目录名称按请求顺序用 '-' 连接，末尾加导出时间戳。"""
+    id_to_name = {d.directory_id: d.directory_name for d in dirs}
+    joined = "-".join(id_to_name[i] for i in ids)
+    return f"{joined}-{dt.datetime.now().strftime('%Y%m%d%H%M%S')}.zip"
+
+
 def create_directory_export(
     db: Session, body: dict[str, Any]
 ) -> dict[str, Any]:
@@ -452,8 +459,7 @@ def create_directory_export(
                 details={"directoryId": d.directory_id, "status": d.import_status},
             )
     export_id = new_id("exp")
-    joined = "-".join(ids[:3])
-    file_name = f"{joined}-{dt.datetime.now().strftime('%Y%m%d%H%M%S')}.zip"
+    file_name = _directory_export_file_name(ids, dirs)
     expire = dt.datetime.utcnow() + dt.timedelta(days=get_settings().dataset_export_retention_days)
     rec = ExportRecord(
         export_record_id=export_id,

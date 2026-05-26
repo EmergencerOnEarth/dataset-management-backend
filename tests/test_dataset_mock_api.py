@@ -191,6 +191,9 @@ def test_records_patient_images_and_exports(client: TestClient):
         client.post("/api/v1/dataset-directories/export", json={"directoryIds": ["dir_demo_001"]})
     )
     assert directory_export["exportType"] == "DATASET_DIRECTORY"
+    assert directory_export["fileName"].startswith("中航数据2026样例目录-")
+    assert directory_export["fileName"].endswith(".zip")
+    assert "dir_demo_001" not in directory_export["fileName"]
 
     patient_export = data(
         client.post("/api/v1/dataset-directories/dir_demo_001/patients/LGTA00087/export", json={})
@@ -687,6 +690,8 @@ def test_export_list_detail_and_download(client: TestClient):
             json={"directoryIds": [did], "includeParsedImages": True},
         )
     )
+    assert dir_exp["fileName"].startswith("导出查询测-")
+    assert did not in dir_exp["fileName"]
     pat_exp = data(
         client.post(
             f"/api/v1/dataset-directories/{did}/patients/LGTA00087/export",
