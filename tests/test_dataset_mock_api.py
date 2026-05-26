@@ -742,6 +742,30 @@ def test_export_list_detail_and_download(client: TestClient):
     bad_page = client.get("/api/v1/dataset-exports", params={"offset": 0, "limit": 0})
     assert bad_page.status_code == 422
 
+    dir_exp_id = dir_exp["exportRecordId"]
+    dir_rec = None
+    for _ in range(180):
+        fac = get_session_factory()
+        db = fac()
+        try:
+            er = db.get(ExportRecord, dir_exp_id)
+            if er and er.export_status in ("DONE", "FAILED"):
+                assert er.export_status == "DONE", (er.export_status, er.failure_reason)
+                dir_rec = er
+                break
+        finally:
+            db.close()
+        time.sleep(0.05)
+    assert dir_rec is not None and dir_rec.ftp_path
+    from backend.app.core.config import get_settings
+    from backend.app.storage.backend import get_storage
+
+    dir_zip_names = zipfile.ZipFile(
+        io.BytesIO(get_storage(get_settings()).get_bytes(dir_rec.ftp_path))
+    ).namelist()
+    assert any(n.startswith("导出查询测/") for n in dir_zip_names), dir_zip_names[:10]
+    assert not any(n.startswith(f"{did}/") for n in dir_zip_names), dir_zip_names[:10]
+
     done_id = pat_exp["exportRecordId"]
     for _ in range(180):
         fac = get_session_factory()

@@ -51,7 +51,12 @@ def _resolve_directory_source_zip(storage: StorageBackend, db: Session, director
 
 
 def _append_directory_tree_from_source(
-    zf: zipfile.ZipFile, storage: StorageBackend, db: Session, directory_id: str
+    zf: zipfile.ZipFile,
+    storage: StorageBackend,
+    db: Session,
+    directory_id: str,
+    *,
+    arc_prefix: str,
 ) -> None:
     zip_path = _resolve_directory_source_zip(storage, db, directory_id)
     raw_zip = storage.get_bytes(zip_path)
@@ -61,7 +66,7 @@ def _append_directory_tree_from_source(
                 continue
             if not _zip_member_safe(m.filename):
                 continue
-            arc = f"{directory_id}/{m.filename.replace(chr(92), '/')}"
+            arc = f"{arc_prefix}/{m.filename.replace(chr(92), '/')}"
             zf.writestr(arc, inner.read(m.filename))
 
 
@@ -77,10 +82,19 @@ def run_directory_export_job(storage: StorageBackend, export_record_id: str) -> 
         ids = rec.payload_json.get("directoryIds") or []
         opts = rec.payload_json.get("options") or {}
         include_parsed = bool(opts.get("includeParsedImages", True))
+        dirs = db.execute(
+            select(DatasetDirectory).where(DatasetDirectory.directory_id.in_(ids))
+        ).scalars().all()
+        id_to_name = {d.directory_id: d.directory_name for d in dirs}
         buf = BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for did in ids:
-                _append_directory_tree_from_source(zf, storage, db, did)
+                folder_name = id_to_name.get(did)
+                if not folder_name:
+                    raise ValueError(f"导出目录不存在: {did}")
+                _append_directory_tree_from_source(
+                    zf, storage, db, did, arc_prefix=folder_name
+                )
                 if include_parsed:
                     imgs = db.execute(
                         select(DatasetImageAsset).where(
@@ -96,7 +110,10 @@ def run_directory_export_job(storage: StorageBackend, export_record_id: str) -> 
                             zp_n = zp.replace("\\", "/")
                             if not _zip_member_safe(zp_n):
                                 continue
-                            zf.writestr(f"{did}/_parsed_derived/{zp_n}", storage.get_bytes(sk))
+                            zf.writestr(
+                                f"{folder_name}/_parsed_derived/{zp_n}",
+                                storage.get_bytes(sk),
+                            )
         data = buf.getvalue()
         out = f"/dataset/export/tmp/{export_record_id}/{rec.file_name}"
         storage.mkdir_p(f"/dataset/export/tmp/{export_record_id}")
