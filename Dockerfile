@@ -11,6 +11,7 @@ ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
 COPY pyproject.toml ./
 COPY backend ./backend
 COPY static ./static
+COPY scripts/backfill_newvision_analysis_results.py ./scripts/backfill_newvision_analysis_results.py
 
 RUN pip install --no-cache-dir --no-build-isolation .
 
