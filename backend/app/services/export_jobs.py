@@ -25,6 +25,7 @@ from backend.app.db.models import (
     DatasetQuestionnaireRecord,
     ExportRecord,
 )
+from backend.app.services.import_pipeline import _decode_zip_member_name
 from backend.app.storage.backend import StorageBackend, normalize_storage_path
 
 
@@ -64,10 +65,11 @@ def _append_directory_tree_from_source(
         for m in inner.infolist():
             if m.is_dir():
                 continue
-            if not _zip_member_safe(m.filename):
+            decoded_name = _decode_zip_member_name(m)
+            if not _zip_member_safe(decoded_name):
                 continue
-            arc = f"{arc_prefix}/{m.filename.replace(chr(92), '/')}"
-            zf.writestr(arc, inner.read(m.filename))
+            arc = f"{arc_prefix}/{decoded_name.replace(chr(92), '/')}"
+            zf.writestr(arc, inner.read(m))
 
 
 def run_directory_export_job(storage: StorageBackend, export_record_id: str) -> None:
