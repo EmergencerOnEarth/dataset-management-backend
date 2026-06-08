@@ -43,6 +43,10 @@ from backend.app.parsers.newvision import (
     parse_newvision_questionnaire_xlsx_bytes,
     select_newvision_questionnaire_xlsx,
 )
+from backend.app.parsers.newvision_analysis import (
+    is_newvision_analysis_result_path,
+    parse_newvision_analysis_result_bytes,
+)
 from backend.app.parsers.newvision_oct import (
     extract_oct_path_context,
     parse_oct_dat_bytes,
@@ -262,6 +266,18 @@ def _merge_oct_fields_into_questionnaire_row(
             )
             .order_by(DatasetQuestionnaireRecord.survey_date)
         ).scalars().first()
+    if not rec:
+        directory_rows = db.execute(
+            select(DatasetQuestionnaireRecord)
+            .where(
+                DatasetQuestionnaireRecord.directory_id == directory_id,
+                DatasetQuestionnaireRecord.deleted == False,  # noqa: E712
+            )
+            .order_by(DatasetQuestionnaireRecord.survey_date)
+            .limit(2)
+        ).scalars().all()
+        if len(directory_rows) == 1:
+            rec = directory_rows[0]
     if not rec:
         return
     cells = dict(rec.normalized_row_json or {})
@@ -572,7 +588,7 @@ def _run_import_core(db: Session, storage: StorageBackend, task: DatasetImportTa
                 data_type = "NUMBER"
                 if isinstance(cv, bool):
                     data_type = "BOOLEAN"
-                elif isinstance(cv, str):
+                elif isinstance(cv, (str, list, dict)) or cv is None:
                     data_type = "STRING"
                 db.add(
                     DatasetDynamicColumn(
@@ -593,7 +609,8 @@ def _run_import_core(db: Session, storage: StorageBackend, task: DatasetImportTa
     #   额外将扁平化标量合并到对应问卷行（last-wins，用于列表展示列；
     #   全量历史数据见各 OCT_JSON 资产的 metadata_json）。
     for rel in sorted(extracted_rels):
-        if not _is_oct_path(rel) or not rel.lower().endswith(".json"):
+        is_analysis_json = is_newvision_analysis_result_path(rel)
+        if not rel.lower().endswith(".json") or (not _is_oct_path(rel) and not is_analysis_json):
             continue
         ctx = extract_oct_path_context(rel)
         pid = ctx.get("pid") or _guess_pid_from_relative(rel, known_pids)
@@ -617,6 +634,10 @@ def _run_import_core(db: Session, storage: StorageBackend, task: DatasetImportTa
         try:
             jraw = storage.get_bytes(f"{raw_tree_base}/{rel}")
             scalar_for_cols = image_stubs.oct_json_scalar_columns(jraw)
+            if is_analysis_json:
+                scalar_for_cols.update(
+                    parse_newvision_analysis_result_bytes(jraw, source_path=rel)
+                )
         except Exception as exc:  # noqa: BLE001
             warning_count += 1
             db.add(

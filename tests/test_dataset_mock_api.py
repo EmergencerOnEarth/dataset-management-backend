@@ -582,6 +582,52 @@ def test_oct_path_folder_case_insensitive(client: TestClient):
     assert task["importStatus"] == "SUCCESS"
 
 
+def test_analysis_result_json_fields_merge_into_record_cells(client: TestClient):
+    repo = Path(__file__).resolve().parents[1]
+    sample_dir = (
+        repo
+        / "test-data/upload-samples/newvision/样例数据/院外导入样例数据/患者原始数据示例"
+    )
+    xbio = io.BytesIO()
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["患者ID", "调查日期", "姓名"])
+    ws.append(["P_ANALYSIS", "2026-03-03", "AnalysisRlt患者"])
+    wb.save(xbio)
+    xbio.seek(0)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("问卷/analysis.xlsx", xbio.read())
+        for path in sorted(sample_dir.glob("*_AnalysisRlt.json")):
+            zf.writestr(f"OCT/P_ANALYSIS/2026-03-03/{path.name}", path.read_bytes())
+
+    task, _ = _flow_upload_import(client, buf.getvalue(), "AnalysisRlt测")
+    assert task["importStatus"] == "SUCCESS", task
+
+    listing = data(client.get("/api/v1/dataset-directories", params={"pageNo": 1, "pageSize": 200}))
+    did = next(r["directoryId"] for r in listing["records"] if r["directoryName"] == "AnalysisRlt测")
+    recs = data(client.get(f"/api/v1/dataset-directories/{did}/records", params={"pageSize": 20}))
+    columns = {c["columnKey"]: c for c in recs["columns"]}
+    row = next(r for r in recs["records"] if r["patientId"] == "P_ANALYSIS")
+    cells = row["cells"]
+
+    expected = {
+        "od_DiscRNFLClockAvg_RNFL上部厚度": 94.675,
+        "od_DiscinfoValue_Cup_Area": 1.2000385802469136,
+        "od_Macular_Avg_Thickness_Nine_Central_Subfield": 263.85858585858585,
+        "os_MacularGCC_Avg_Thickness_Six_Temporal_Superior": 87.82137390330409,
+        "os__macular_json": "os-radialscan-macular-20251021-090634-001_AnalysisRlt.json",
+    }
+    for key, value in expected.items():
+        assert key in columns
+        assert key in cells
+        if isinstance(value, str):
+            assert cells[key] == value
+        else:
+            assert cells[key] == pytest.approx(value)
+
+
 def test_patient_export_contains_parsed_jpeg_and_oct_json(client: TestClient):
     """患者导出含眼底解析图（JPEG）；OCT sidecar 仅当有 *-001.dat 入库影像时随 PARSED_OCT_DAT 导出。"""
     from backend.app.core.config import get_settings
