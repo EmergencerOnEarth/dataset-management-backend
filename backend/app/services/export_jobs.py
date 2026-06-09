@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import json
 import re
+import csv
 import zipfile
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 
 from typing import Any, Iterator
@@ -20,6 +21,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.db.models import (
     DatasetDirectory,
+    DatasetDynamicColumn,
     DatasetImageAsset,
     DatasetImageMetadata,
     DatasetMergedFile,
@@ -127,6 +129,32 @@ def _questionnaire_rows(
     return [r.normalized_row_json or {} for r in rows]
 
 
+def _questionnaire_records(
+    db: Session,
+    directory_ids: list[str],
+    *,
+    patient_id: str | None = None,
+    date_filt: set[str] | None = None,
+) -> list[DatasetQuestionnaireRecord]:
+    filters = [
+        DatasetQuestionnaireRecord.directory_id.in_(directory_ids),
+        DatasetQuestionnaireRecord.deleted == False,  # noqa: E712
+    ]
+    if patient_id is not None:
+        filters.append(DatasetQuestionnaireRecord.patient_id == patient_id)
+    if date_filt is not None:
+        filters.append(DatasetQuestionnaireRecord.survey_date.in_(date_filt))
+    return db.execute(
+        select(DatasetQuestionnaireRecord)
+        .where(*filters)
+        .order_by(
+            DatasetQuestionnaireRecord.directory_id,
+            DatasetQuestionnaireRecord.survey_date,
+            DatasetQuestionnaireRecord.record_id,
+        )
+    ).scalars().all()
+
+
 def _write_questionnaire_rows(
     zf: zipfile.ZipFile,
     rows: list[dict[str, Any]],
@@ -136,6 +164,111 @@ def _write_questionnaire_rows(
 ) -> None:
     payload = json.dumps(rows, ensure_ascii=False, indent=2).encode("utf-8")
     _write_zip_member(zf, arcname, payload, written=written)
+
+
+def _csv_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
+
+
+def _parsed_json_payload(rec: DatasetQuestionnaireRecord) -> dict[str, Any]:
+    raw = rec.raw_row_json or {}
+    normalized = rec.normalized_row_json or {}
+    excluded = set(raw.keys()) | {"patientId", "surveyDate", "newvisionImportPayload"}
+    return {k: v for k, v in normalized.items() if k not in excluded}
+
+
+def _column_titles_by_directory(
+    db: Session, directory_ids: list[str]
+) -> dict[str, list[tuple[str, str]]]:
+    rows = db.execute(
+        select(DatasetDynamicColumn)
+        .where(
+            DatasetDynamicColumn.directory_id.in_(directory_ids),
+            DatasetDynamicColumn.source_type == "QUESTIONNAIRE",
+        )
+        .order_by(DatasetDynamicColumn.directory_id, DatasetDynamicColumn.display_order)
+    ).scalars().all()
+    out: dict[str, list[tuple[str, str]]] = {}
+    for col in rows:
+        out.setdefault(col.directory_id, []).append((col.column_key, col.column_title))
+    return out
+
+
+def _fallback_raw_columns(rec: DatasetQuestionnaireRecord) -> list[tuple[str, str]]:
+    raw = rec.raw_row_json or {}
+    return [(key, key) for key in raw.keys()]
+
+
+def _merged_questionnaire_csv_bytes(
+    db: Session,
+    records: list[DatasetQuestionnaireRecord],
+    *,
+    directories_by_id: dict[str, DatasetDirectory],
+    include_directory_context: bool,
+) -> bytes:
+    directory_ids = list(dict.fromkeys(r.directory_id for r in records))
+    titles_by_dir = _column_titles_by_directory(db, directory_ids)
+    raw_headers: list[str] = []
+    seen_headers: set[str] = set()
+    for rec in records:
+        cols = titles_by_dir.get(rec.directory_id) or _fallback_raw_columns(rec)
+        for _, title in cols:
+            if title not in seen_headers:
+                seen_headers.add(title)
+                raw_headers.append(title)
+
+    headers: list[str] = []
+    if include_directory_context:
+        headers.extend(["目录ID", "目录名称"])
+    headers.extend(raw_headers)
+    headers.append("JSON解析数据")
+
+    sio = StringIO()
+    writer = csv.DictWriter(sio, fieldnames=headers, extrasaction="ignore")
+    writer.writeheader()
+    for rec in records:
+        out: dict[str, str] = {}
+        if include_directory_context:
+            directory = directories_by_id.get(rec.directory_id)
+            out["目录ID"] = rec.directory_id
+            out["目录名称"] = directory.directory_name if directory else rec.directory_id
+        raw = rec.raw_row_json or {}
+        normalized = rec.normalized_row_json or {}
+        cols = titles_by_dir.get(rec.directory_id) or _fallback_raw_columns(rec)
+        for key, title in cols:
+            out[title] = _csv_cell(raw.get(key, normalized.get(key)))
+        out["JSON解析数据"] = json.dumps(
+            _parsed_json_payload(rec), ensure_ascii=False, sort_keys=True
+        )
+        writer.writerow(out)
+    return ("\ufeff" + sio.getvalue()).encode("utf-8")
+
+
+def _write_merged_questionnaire_csv(
+    zf: zipfile.ZipFile,
+    db: Session,
+    records: list[DatasetQuestionnaireRecord],
+    *,
+    directories_by_id: dict[str, DatasetDirectory],
+    include_directory_context: bool,
+    arcname: str,
+    written: set[str] | None = None,
+) -> None:
+    _write_zip_member(
+        zf,
+        arcname,
+        _merged_questionnaire_csv_bytes(
+            db,
+            records,
+            directories_by_id=directories_by_id,
+            include_directory_context=include_directory_context,
+        ),
+        written=written,
+    )
 
 
 _DATE_IN_PATH_RE = re.compile(
@@ -189,6 +322,59 @@ def _append_patient_members_from_source(
         return
 
 
+def _successful_patient_directories(
+    db: Session,
+    patient_id: str,
+) -> list[DatasetDirectory]:
+    q_dirs = set(
+        db.scalars(
+            select(DatasetQuestionnaireRecord.directory_id)
+            .join(
+                DatasetDirectory,
+                DatasetDirectory.directory_id == DatasetQuestionnaireRecord.directory_id,
+            )
+            .where(
+                DatasetQuestionnaireRecord.patient_id == patient_id,
+                DatasetQuestionnaireRecord.deleted == False,  # noqa: E712
+                DatasetDirectory.deleted == False,  # noqa: E712
+                DatasetDirectory.import_status == "SUCCESS",
+            )
+            .distinct()
+        ).all()
+    )
+    img_dirs = set(
+        db.scalars(
+            select(DatasetImageAsset.directory_id)
+            .join(DatasetDirectory, DatasetDirectory.directory_id == DatasetImageAsset.directory_id)
+            .where(
+                DatasetImageAsset.patient_id == patient_id,
+                DatasetImageAsset.deleted == False,  # noqa: E712
+                DatasetDirectory.deleted == False,  # noqa: E712
+                DatasetDirectory.import_status == "SUCCESS",
+            )
+            .distinct()
+        ).all()
+    )
+    directory_ids = sorted(q_dirs | img_dirs)
+    if not directory_ids:
+        return []
+    return db.execute(
+        select(DatasetDirectory)
+        .where(DatasetDirectory.directory_id.in_(directory_ids))
+        .order_by(
+            DatasetDirectory.imported_at,
+            DatasetDirectory.created_at,
+            DatasetDirectory.directory_id,
+        )
+    ).scalars().all()
+
+
+def _patient_archive_prefix(directory: DatasetDirectory, directory_count: int) -> str:
+    if directory_count <= 1:
+        return "images"
+    return f"images/{directory.directory_name}"
+
+
 def run_directory_export_job(storage: StorageBackend, export_record_id: str) -> None:
     from backend.app.db.session import get_session_factory
 
@@ -206,6 +392,7 @@ def run_directory_export_job(storage: StorageBackend, export_record_id: str) -> 
             select(DatasetDirectory).where(DatasetDirectory.directory_id.in_(ids))
         ).scalars().all()
         id_to_name = {d.directory_id: d.directory_name for d in dirs}
+        directories_by_id = {d.directory_id: d for d in dirs}
         buf = BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             written: set[str] = set()
@@ -217,10 +404,20 @@ def run_directory_export_job(storage: StorageBackend, export_record_id: str) -> 
                     zf, storage, db, did, arc_prefix=folder_name, written=written
                 )
                 if include_merged_table:
+                    q_records = _questionnaire_records(db, [did])
                     _write_questionnaire_rows(
                         zf,
-                        _questionnaire_rows(db, did),
+                        [r.normalized_row_json or {} for r in q_records],
                         arcname=f"{folder_name}/questionnaire_rows.json",
+                        written=written,
+                    )
+                    _write_merged_questionnaire_csv(
+                        zf,
+                        db,
+                        q_records,
+                        directories_by_id=directories_by_id,
+                        include_directory_context=False,
+                        arcname=f"{folder_name}/merged_questionnaire.csv",
                         written=written,
                     )
                 if include_parsed:
@@ -372,14 +569,34 @@ def run_patient_export_job(storage: StorageBackend, export_record_id: str) -> No
 
         include_original_attachments = bool(opts.get("includeOriginalAttachments", True))
         include_parsed_images = bool(opts.get("includeParsedImages", True))
+        scope_dirs = _successful_patient_directories(db, pid)
+        scope_ids = [d.directory_id for d in scope_dirs]
+        directories_by_id = {d.directory_id: d for d in scope_dirs}
 
         buf = BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             written: set[str] = set()
+            if scope_ids:
+                q_filters[0] = DatasetQuestionnaireRecord.directory_id.in_(scope_ids)
+                img_filters[0] = DatasetImageAsset.directory_id.in_(scope_ids)
             rows = db.execute(
-                select(DatasetQuestionnaireRecord).where(*q_filters)
+                select(DatasetQuestionnaireRecord)
+                .where(*q_filters)
+                .order_by(
+                    DatasetQuestionnaireRecord.directory_id,
+                    DatasetQuestionnaireRecord.survey_date,
+                    DatasetQuestionnaireRecord.record_id,
+                )
             ).scalars().all()
-            imgs = db.execute(select(DatasetImageAsset).where(*img_filters)).scalars().all()
+            imgs = db.execute(
+                select(DatasetImageAsset)
+                .where(*img_filters)
+                .order_by(
+                    DatasetImageAsset.directory_id,
+                    DatasetImageAsset.survey_date,
+                    DatasetImageAsset.image_id,
+                )
+            ).scalars().all()
             if date_filt is not None and not rows and not imgs:
                 raise ValueError("指定 surveyDates 条件下无问卷或影像可导出。")
             _write_questionnaire_rows(
@@ -388,24 +605,40 @@ def run_patient_export_job(storage: StorageBackend, export_record_id: str) -> No
                 arcname="questionnaire_rows.json",
                 written=written,
             )
+            _write_merged_questionnaire_csv(
+                zf,
+                db,
+                rows,
+                directories_by_id=directories_by_id,
+                include_directory_context=True,
+                arcname="patient_merged_questionnaire.csv",
+                written=written,
+            )
             if include_original_attachments:
-                _append_patient_members_from_source(
-                    zf,
-                    storage,
-                    db,
-                    did,
-                    pid,
-                    date_filt=date_filt,
-                    arc_prefix="images",
-                    written=written,
-                )
+                for directory in scope_dirs:
+                    _append_patient_members_from_source(
+                        zf,
+                        storage,
+                        db,
+                        directory.directory_id,
+                        pid,
+                        date_filt=date_filt,
+                        arc_prefix=_patient_archive_prefix(directory, len(scope_dirs)),
+                        written=written,
+                    )
             for img in imgs:
                 op_key = normalize_storage_path(img.original_path)
-                arc = _relative_image_arc(did, img.original_path, img.image_name)
+                arc = _relative_image_arc(img.directory_id, img.original_path, img.image_name)
+                directory = directories_by_id.get(img.directory_id)
+                image_prefix = (
+                    _patient_archive_prefix(directory, len(scope_dirs))
+                    if directory
+                    else "images"
+                )
                 if include_original_attachments and storage.exists(op_key):
                     _write_zip_member(
                         zf,
-                        f"images/{arc}",
+                        f"{image_prefix}/{arc}",
                         storage.get_bytes(op_key),
                         written=written,
                     )
@@ -415,13 +648,13 @@ def run_patient_export_job(storage: StorageBackend, export_record_id: str) -> No
                         storage,
                         img,
                         meta_row.metadata_json if meta_row else None,
-                        did,
+                        img.directory_id,
                     )
                     for sk, zp in entries:
                         zp_n = zp.replace("\\", "/")
                         _write_zip_member(
                             zf,
-                            f"images/parsed/{zp_n}",
+                            f"{image_prefix}/parsed/{zp_n}",
                             storage.get_bytes(sk),
                             written=written,
                         )
@@ -434,7 +667,7 @@ def run_patient_export_job(storage: StorageBackend, export_record_id: str) -> No
                         json_arc = Path(arc.replace("\\", "/")).with_suffix(".json").as_posix()
                         _write_zip_member(
                             zf,
-                            f"images/oct_json/{json_arc}",
+                            f"{image_prefix}/oct_json/{json_arc}",
                             storage.get_bytes(jkey),
                             written=written,
                         )

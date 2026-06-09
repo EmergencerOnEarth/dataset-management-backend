@@ -353,20 +353,42 @@ def patient_timeline(db: Session, directory_id: str, patient_id: str) -> dict[st
     if not d or d.deleted:
         raise NotFoundError("数据目录不存在。")
     rows = db.execute(
-        select(DatasetImageAsset.survey_date, func.count())
+        select(
+            DatasetImageAsset.survey_date,
+            DatasetDirectory.directory_id,
+            DatasetDirectory.directory_name,
+            func.count(),
+        )
+        .join(DatasetDirectory, DatasetDirectory.directory_id == DatasetImageAsset.directory_id)
         .where(
-            DatasetImageAsset.directory_id == directory_id,
             DatasetImageAsset.patient_id == patient_id,
             DatasetImageAsset.deleted == False,  # noqa: E712
+            DatasetDirectory.deleted == False,  # noqa: E712
+            DatasetDirectory.import_status == "SUCCESS",
         )
-        .group_by(DatasetImageAsset.survey_date)
+        .group_by(
+            DatasetImageAsset.survey_date,
+            DatasetDirectory.directory_id,
+            DatasetDirectory.directory_name,
+        )
     ).all()
-    counts = {d0: c for d0, c in rows}
+    by_date: dict[str, dict[str, Any]] = {}
+    for survey_date, did, directory_name, count in rows:
+        bucket = by_date.setdefault(survey_date, {"imageCount": 0, "directories": []})
+        bucket["imageCount"] += count
+        bucket["directories"].append(
+            {"directoryId": did, "directoryName": directory_name, "imageCount": count}
+        )
+    for bucket in by_date.values():
+        bucket["directories"].sort(key=lambda x: (x["directoryName"], x["directoryId"]))
+
+    counts = {survey_date: data["imageCount"] for survey_date, data in by_date.items()}
     sorted_dates = sorted(counts.keys(), reverse=True)
     dates = [
         {
             "surveyDate": date,
             "imageCount": counts[date],
+            "directories": by_date[date]["directories"],
             "defaultSelected": i == 0,
         }
         for i, date in enumerate(sorted_dates)
@@ -381,24 +403,36 @@ def patient_images(
     if not d or d.deleted:
         raise NotFoundError("数据目录不存在。")
     filters = [
-        DatasetImageAsset.directory_id == directory_id,
         DatasetImageAsset.patient_id == patient_id,
         DatasetImageAsset.survey_date == survey_date,
         DatasetImageAsset.deleted == False,  # noqa: E712
+        DatasetDirectory.deleted == False,  # noqa: E712
+        DatasetDirectory.import_status == "SUCCESS",
     ]
-    total = db.scalar(select(func.count()).select_from(DatasetImageAsset).where(*filters)) or 0
+    total = (
+        db.scalar(
+            select(func.count())
+            .select_from(DatasetImageAsset)
+            .join(DatasetDirectory, DatasetDirectory.directory_id == DatasetImageAsset.directory_id)
+            .where(*filters)
+        )
+        or 0
+    )
     imgs = db.execute(
-        select(DatasetImageAsset)
+        select(DatasetImageAsset, DatasetDirectory.directory_name)
+        .join(DatasetDirectory, DatasetDirectory.directory_id == DatasetImageAsset.directory_id)
         .where(*filters)
-        .order_by(DatasetImageAsset.image_id)
+        .order_by(DatasetDirectory.directory_name, DatasetImageAsset.image_id)
         .offset((page_no - 1) * page_size)
         .limit(page_size)
-    ).scalars().all()
+    ).all()
     records = []
-    for i in imgs:
+    for i, directory_name in imgs:
         records.append(
             {
                 "imageId": i.image_id,
+                "directoryId": i.directory_id,
+                "directoryName": directory_name,
                 "patientId": i.patient_id,
                 "surveyDate": i.survey_date,
                 "imageName": i.image_name,
@@ -415,18 +449,26 @@ def patient_images(
 
 
 def image_detail(db: Session, directory_id: str, patient_id: str, image_id: str) -> dict[str, Any]:
+    context = db.get(DatasetDirectory, directory_id)
+    if not context or context.deleted:
+        raise NotFoundError("数据目录不存在。")
     img = db.get(DatasetImageAsset, image_id)
+    directory = db.get(DatasetDirectory, img.directory_id) if img else None
     if (
         not img
         or img.deleted
-        or img.directory_id != directory_id
         or img.patient_id != patient_id
+        or not directory
+        or directory.deleted
+        or directory.import_status != "SUCCESS"
     ):
         raise NotFoundError("影像不存在。")
     meta_row = db.get(DatasetImageMetadata, image_id)
     meta_json = meta_row.metadata_json if meta_row else {}
     return {
         "imageId": img.image_id,
+        "directoryId": img.directory_id,
+        "directoryName": directory.directory_name,
         "previewUrl": img.preview_path,
         "frameUrl": _frame_url(img),
         "originalUrl": f"/api/v1/dataset-files/{img.image_id}/original",
@@ -493,24 +535,31 @@ def create_patient_export(
     qc = db.scalar(
         select(func.count())
         .select_from(DatasetQuestionnaireRecord)
+        .join(
+            DatasetDirectory,
+            DatasetDirectory.directory_id == DatasetQuestionnaireRecord.directory_id,
+        )
         .where(
-            DatasetQuestionnaireRecord.directory_id == directory_id,
             DatasetQuestionnaireRecord.patient_id == patient_id,
             DatasetQuestionnaireRecord.deleted == False,  # noqa: E712
+            DatasetDirectory.deleted == False,  # noqa: E712
+            DatasetDirectory.import_status == "SUCCESS",
         )
     ) or 0
     ic = db.scalar(
         select(func.count())
         .select_from(DatasetImageAsset)
+        .join(DatasetDirectory, DatasetDirectory.directory_id == DatasetImageAsset.directory_id)
         .where(
-            DatasetImageAsset.directory_id == directory_id,
             DatasetImageAsset.patient_id == patient_id,
             DatasetImageAsset.deleted == False,  # noqa: E712
+            DatasetDirectory.deleted == False,  # noqa: E712
+            DatasetDirectory.import_status == "SUCCESS",
         )
     ) or 0
     if qc == 0 and ic == 0:
         raise AppError(
-            "该患者在目录下无可导出的问卷或影像资源。",
+            "该患者无可导出的问卷或影像资源。",
             "DATASET_EXPORT_PATIENT_EMPTY",
         )
 
