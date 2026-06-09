@@ -7,11 +7,12 @@
 from __future__ import annotations
 
 import json
+import re
 import zipfile
 from io import BytesIO
 from pathlib import Path
 
-from typing import Any
+from typing import Any, Iterator
 
 from sqlalchemy import select
 
@@ -39,6 +40,24 @@ def _zip_member_safe(name: str) -> bool:
     return ".." not in p.parts and not p.is_absolute()
 
 
+def _write_zip_member(
+    zf: zipfile.ZipFile,
+    arcname: str,
+    data: bytes,
+    *,
+    written: set[str] | None = None,
+) -> bool:
+    normalized = arcname.replace("\\", "/")
+    if not _zip_member_safe(normalized):
+        return False
+    if written is not None:
+        if normalized in written:
+            return False
+        written.add(normalized)
+    zf.writestr(normalized, data)
+    return True
+
+
 def _resolve_directory_source_zip(storage: StorageBackend, db: Session, directory_id: str) -> str:
     canonical = f"/dataset/import/raw_zip/{directory_id}/source.zip"
     if storage.exists(canonical):
@@ -51,14 +70,11 @@ def _resolve_directory_source_zip(storage: StorageBackend, db: Session, director
     raise ExportSourceZipMissing(directory_id)
 
 
-def _append_directory_tree_from_source(
-    zf: zipfile.ZipFile,
+def _iter_directory_source_members(
     storage: StorageBackend,
     db: Session,
     directory_id: str,
-    *,
-    arc_prefix: str,
-) -> None:
+) -> Iterator[tuple[str, bytes]]:
     zip_path = _resolve_directory_source_zip(storage, db, directory_id)
     raw_zip = storage.get_bytes(zip_path)
     with zipfile.ZipFile(BytesIO(raw_zip), "r") as inner:
@@ -68,8 +84,109 @@ def _append_directory_tree_from_source(
             decoded_name = _decode_zip_member_name(m)
             if not _zip_member_safe(decoded_name):
                 continue
-            arc = f"{arc_prefix}/{decoded_name.replace(chr(92), '/')}"
-            zf.writestr(arc, inner.read(m))
+            yield decoded_name.replace("\\", "/"), inner.read(m)
+
+
+def _append_directory_tree_from_source(
+    zf: zipfile.ZipFile,
+    storage: StorageBackend,
+    db: Session,
+    directory_id: str,
+    *,
+    arc_prefix: str,
+    written: set[str] | None = None,
+) -> None:
+    for decoded_name, data in _iter_directory_source_members(storage, db, directory_id):
+        _write_zip_member(zf, f"{arc_prefix}/{decoded_name}", data, written=written)
+
+
+def _questionnaire_rows(
+    db: Session,
+    directory_id: str,
+    *,
+    patient_id: str | None = None,
+    date_filt: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    filters = [
+        DatasetQuestionnaireRecord.directory_id == directory_id,
+        DatasetQuestionnaireRecord.deleted == False,  # noqa: E712
+    ]
+    if patient_id is not None:
+        filters.append(DatasetQuestionnaireRecord.patient_id == patient_id)
+    if date_filt is not None:
+        filters.append(DatasetQuestionnaireRecord.survey_date.in_(date_filt))
+    rows = db.execute(
+        select(DatasetQuestionnaireRecord)
+        .where(*filters)
+        .order_by(
+            DatasetQuestionnaireRecord.patient_id,
+            DatasetQuestionnaireRecord.survey_date,
+            DatasetQuestionnaireRecord.record_id,
+        )
+    ).scalars().all()
+    return [r.normalized_row_json or {} for r in rows]
+
+
+def _write_questionnaire_rows(
+    zf: zipfile.ZipFile,
+    rows: list[dict[str, Any]],
+    *,
+    arcname: str,
+    written: set[str] | None = None,
+) -> None:
+    payload = json.dumps(rows, ensure_ascii=False, indent=2).encode("utf-8")
+    _write_zip_member(zf, arcname, payload, written=written)
+
+
+_DATE_IN_PATH_RE = re.compile(
+    r"(?<!\d)((?:19|20)\d{2})[-_.]?([01]?\d)[-_.]?([0-3]?\d)(?!\d)"
+)
+
+
+def _dates_in_member_name(name: str) -> set[str]:
+    out: set[str] = set()
+    for year, month, day in _DATE_IN_PATH_RE.findall(name.replace("\\", "/")):
+        try:
+            m = int(month)
+            d = int(day)
+        except ValueError:
+            continue
+        if 1 <= m <= 12 and 1 <= d <= 31:
+            out.add(f"{int(year):04d}-{m:02d}-{d:02d}")
+    return out
+
+
+def _source_member_matches_patient(
+    member_name: str,
+    patient_id: str,
+    date_filt: set[str] | None,
+) -> bool:
+    parts = [part for part in member_name.replace("\\", "/").split("/") if part]
+    if patient_id not in parts:
+        return False
+    if date_filt is None:
+        return True
+    member_dates = _dates_in_member_name(member_name)
+    return not member_dates or bool(member_dates & date_filt)
+
+
+def _append_patient_members_from_source(
+    zf: zipfile.ZipFile,
+    storage: StorageBackend,
+    db: Session,
+    directory_id: str,
+    patient_id: str,
+    *,
+    date_filt: set[str] | None,
+    arc_prefix: str,
+    written: set[str] | None = None,
+) -> None:
+    try:
+        for member_name, data in _iter_directory_source_members(storage, db, directory_id):
+            if _source_member_matches_patient(member_name, patient_id, date_filt):
+                _write_zip_member(zf, f"{arc_prefix}/{member_name}", data, written=written)
+    except ExportSourceZipMissing:
+        return
 
 
 def run_directory_export_job(storage: StorageBackend, export_record_id: str) -> None:
@@ -84,19 +201,28 @@ def run_directory_export_job(storage: StorageBackend, export_record_id: str) -> 
         ids = rec.payload_json.get("directoryIds") or []
         opts = rec.payload_json.get("options") or {}
         include_parsed = bool(opts.get("includeParsedImages", True))
+        include_merged_table = bool(opts.get("includeMergedTable", True))
         dirs = db.execute(
             select(DatasetDirectory).where(DatasetDirectory.directory_id.in_(ids))
         ).scalars().all()
         id_to_name = {d.directory_id: d.directory_name for d in dirs}
         buf = BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            written: set[str] = set()
             for did in ids:
                 folder_name = id_to_name.get(did)
                 if not folder_name:
                     raise ValueError(f"导出目录不存在: {did}")
                 _append_directory_tree_from_source(
-                    zf, storage, db, did, arc_prefix=folder_name
+                    zf, storage, db, did, arc_prefix=folder_name, written=written
                 )
+                if include_merged_table:
+                    _write_questionnaire_rows(
+                        zf,
+                        _questionnaire_rows(db, did),
+                        arcname=f"{folder_name}/questionnaire_rows.json",
+                        written=written,
+                    )
                 if include_parsed:
                     imgs = db.execute(
                         select(DatasetImageAsset).where(
@@ -110,11 +236,11 @@ def run_directory_export_job(storage: StorageBackend, export_record_id: str) -> 
                         meta_js = meta_row.metadata_json if meta_row else None
                         for sk, zp in parsed_derivative_zip_entries(storage, img, meta_js, did):
                             zp_n = zp.replace("\\", "/")
-                            if not _zip_member_safe(zp_n):
-                                continue
-                            zf.writestr(
+                            _write_zip_member(
+                                zf,
                                 f"{folder_name}/_parsed_derived/{zp_n}",
                                 storage.get_bytes(sk),
+                                written=written,
                             )
         data = buf.getvalue()
         out = f"/dataset/export/tmp/{export_record_id}/{rec.file_name}"
@@ -178,7 +304,9 @@ def parsed_derivative_zip_entries(
     if not img.parsed_path:
         return []
     parsed0 = normalize_storage_path(img.parsed_path.replace("\\", "/"))
-    mirrored = _relative_image_arc(directory_id, img.original_path, img.image_name).replace("\\", "/")
+    mirrored = _relative_image_arc(
+        directory_id, img.original_path, img.image_name
+    ).replace("\\", "/")
     mirrored_p = Path(mirrored)
     oct_blob = metadata_json.get("octDat") if isinstance(metadata_json, dict) else None
     frames = oct_blob.get("frames") if isinstance(oct_blob, dict) else None
@@ -247,19 +375,40 @@ def run_patient_export_job(storage: StorageBackend, export_record_id: str) -> No
 
         buf = BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            rows = db.execute(select(DatasetQuestionnaireRecord).where(*q_filters)).scalars().all()
+            written: set[str] = set()
+            rows = db.execute(
+                select(DatasetQuestionnaireRecord).where(*q_filters)
+            ).scalars().all()
             imgs = db.execute(select(DatasetImageAsset).where(*img_filters)).scalars().all()
             if date_filt is not None and not rows and not imgs:
                 raise ValueError("指定 surveyDates 条件下无问卷或影像可导出。")
-            zf.writestr(
-                "questionnaire_rows.json",
-                json.dumps([r.normalized_row_json for r in rows], ensure_ascii=False, indent=2).encode("utf-8"),
+            _write_questionnaire_rows(
+                zf,
+                [r.normalized_row_json or {} for r in rows],
+                arcname="questionnaire_rows.json",
+                written=written,
             )
+            if include_original_attachments:
+                _append_patient_members_from_source(
+                    zf,
+                    storage,
+                    db,
+                    did,
+                    pid,
+                    date_filt=date_filt,
+                    arc_prefix="images",
+                    written=written,
+                )
             for img in imgs:
                 op_key = normalize_storage_path(img.original_path)
                 arc = _relative_image_arc(did, img.original_path, img.image_name)
                 if include_original_attachments and storage.exists(op_key):
-                    zf.writestr(f"images/{arc}", storage.get_bytes(op_key))
+                    _write_zip_member(
+                        zf,
+                        f"images/{arc}",
+                        storage.get_bytes(op_key),
+                        written=written,
+                    )
                 if include_parsed_images and img.parsed_path:
                     meta_row = db.get(DatasetImageMetadata, img.image_id)
                     entries = parsed_derivative_zip_entries(
@@ -270,13 +419,25 @@ def run_patient_export_job(storage: StorageBackend, export_record_id: str) -> No
                     )
                     for sk, zp in entries:
                         zp_n = zp.replace("\\", "/")
-                        if _zip_member_safe(zp_n):
-                            zf.writestr(f"images/parsed/{zp_n}", storage.get_bytes(sk))
-                if include_original_attachments and img.source_type in ("PARSED_DAT", "PARSED_OCT_DAT"):
+                        _write_zip_member(
+                            zf,
+                            f"images/parsed/{zp_n}",
+                            storage.get_bytes(sk),
+                            written=written,
+                        )
+                if include_original_attachments and img.source_type in (
+                    "PARSED_DAT",
+                    "PARSED_OCT_DAT",
+                ):
                     jkey = _oct_json_logical_path(op_key)
                     if jkey and storage.exists(jkey):
                         json_arc = Path(arc.replace("\\", "/")).with_suffix(".json").as_posix()
-                        zf.writestr(f"images/oct_json/{json_arc}", storage.get_bytes(jkey))
+                        _write_zip_member(
+                            zf,
+                            f"images/oct_json/{json_arc}",
+                            storage.get_bytes(jkey),
+                            written=written,
+                        )
         data = buf.getvalue()
         out = f"/dataset/export/tmp/{export_record_id}/{rec.file_name}"
         storage.mkdir_p(f"/dataset/export/tmp/{export_record_id}")
