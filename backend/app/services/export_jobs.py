@@ -181,26 +181,40 @@ def _parsed_json_payload(rec: DatasetQuestionnaireRecord) -> dict[str, Any]:
     return {k: v for k, v in normalized.items() if k not in excluded}
 
 
-def _column_titles_by_directory(
+def _dynamic_columns_by_directory(
     db: Session, directory_ids: list[str]
-) -> dict[str, list[tuple[str, str]]]:
+) -> dict[str, list[DatasetDynamicColumn]]:
+    if not directory_ids:
+        return {}
     rows = db.execute(
         select(DatasetDynamicColumn)
-        .where(
-            DatasetDynamicColumn.directory_id.in_(directory_ids),
-            DatasetDynamicColumn.source_type == "QUESTIONNAIRE",
-        )
+        .where(DatasetDynamicColumn.directory_id.in_(directory_ids))
         .order_by(DatasetDynamicColumn.directory_id, DatasetDynamicColumn.display_order)
     ).scalars().all()
-    out: dict[str, list[tuple[str, str]]] = {}
+    out: dict[str, list[DatasetDynamicColumn]] = {}
     for col in rows:
-        out.setdefault(col.directory_id, []).append((col.column_key, col.column_title))
+        out.setdefault(col.directory_id, []).append(col)
     return out
 
 
 def _fallback_raw_columns(rec: DatasetQuestionnaireRecord) -> list[tuple[str, str]]:
     raw = rec.raw_row_json or {}
     return [(key, key) for key in raw.keys()]
+
+
+def _unique_csv_header(preferred: str | None, fallback: str, seen: set[str]) -> str:
+    for value in (preferred, fallback):
+        header = str(value or "").strip()
+        if header and header not in seen:
+            seen.add(header)
+            return header
+    base = str(fallback or preferred or "字段").strip() or "字段"
+    idx = 2
+    while f"{base}_{idx}" in seen:
+        idx += 1
+    header = f"{base}_{idx}"
+    seen.add(header)
+    return header
 
 
 def _merged_questionnaire_csv_bytes(
@@ -211,21 +225,52 @@ def _merged_questionnaire_csv_bytes(
     include_directory_context: bool,
 ) -> bytes:
     directory_ids = list(dict.fromkeys(r.directory_id for r in records))
-    titles_by_dir = _column_titles_by_directory(db, directory_ids)
+    dynamic_by_dir = _dynamic_columns_by_directory(db, directory_ids)
+    questionnaire_by_dir: dict[str, list[tuple[str, str]]] = {
+        directory_id: [
+            (col.column_key, col.column_title)
+            for col in cols
+            if col.source_type == "QUESTIONNAIRE"
+        ]
+        for directory_id, cols in dynamic_by_dir.items()
+    }
+
     raw_headers: list[str] = []
-    seen_headers: set[str] = set()
+    raw_header_by_dir_key: dict[tuple[str, str], str] = {}
+    raw_header_by_title: dict[str, str] = {}
+    seen_headers: set[str] = {"目录ID", "目录名称"} if include_directory_context else set()
     for rec in records:
-        cols = titles_by_dir.get(rec.directory_id) or _fallback_raw_columns(rec)
-        for _, title in cols:
-            if title not in seen_headers:
-                seen_headers.add(title)
-                raw_headers.append(title)
+        cols = questionnaire_by_dir.get(rec.directory_id) or _fallback_raw_columns(rec)
+        for key, title in cols:
+            preferred = title or key
+            if preferred not in raw_header_by_title:
+                raw_header_by_title[preferred] = _unique_csv_header(preferred, key, seen_headers)
+                raw_headers.append(raw_header_by_title[preferred])
+            raw_header_by_dir_key[(rec.directory_id, key)] = raw_header_by_title[preferred]
+
+    parsed_payloads = {rec.record_id: _parsed_json_payload(rec) for rec in records}
+    parsed_keys_present: set[str] = set()
+    for payload in parsed_payloads.values():
+        parsed_keys_present.update(payload.keys())
+
+    parsed_columns: list[tuple[str, str]] = []
+    seen_parsed_keys: set[str] = set()
+    for rec in records:
+        payload = parsed_payloads[rec.record_id]
+        for col in dynamic_by_dir.get(rec.directory_id, []):
+            if col.column_key in payload and col.column_key not in seen_parsed_keys:
+                header = _unique_csv_header(col.column_title, col.column_key, seen_headers)
+                parsed_columns.append((col.column_key, header))
+                seen_parsed_keys.add(col.column_key)
+    for key in sorted(parsed_keys_present - seen_parsed_keys):
+        header = _unique_csv_header(key, key, seen_headers)
+        parsed_columns.append((key, header))
 
     headers: list[str] = []
     if include_directory_context:
         headers.extend(["目录ID", "目录名称"])
     headers.extend(raw_headers)
-    headers.append("JSON解析数据")
+    headers.extend(header for _, header in parsed_columns)
 
     sio = StringIO()
     writer = csv.DictWriter(sio, fieldnames=headers, extrasaction="ignore")
@@ -238,12 +283,13 @@ def _merged_questionnaire_csv_bytes(
             out["目录名称"] = directory.directory_name if directory else rec.directory_id
         raw = rec.raw_row_json or {}
         normalized = rec.normalized_row_json or {}
-        cols = titles_by_dir.get(rec.directory_id) or _fallback_raw_columns(rec)
+        cols = questionnaire_by_dir.get(rec.directory_id) or _fallback_raw_columns(rec)
         for key, title in cols:
-            out[title] = _csv_cell(raw.get(key, normalized.get(key)))
-        out["JSON解析数据"] = json.dumps(
-            _parsed_json_payload(rec), ensure_ascii=False, sort_keys=True
-        )
+            header = raw_header_by_dir_key.get((rec.directory_id, key), title)
+            out[header] = _csv_cell(raw.get(key, normalized.get(key)))
+        parsed_payload = parsed_payloads[rec.record_id]
+        for key, header in parsed_columns:
+            out[header] = _csv_cell(parsed_payload.get(key))
         writer.writerow(out)
     return ("\ufeff" + sio.getvalue()).encode("utf-8")
 

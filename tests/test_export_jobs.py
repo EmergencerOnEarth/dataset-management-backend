@@ -140,6 +140,26 @@ def _add_questionnaire_columns(db, directory_id: str) -> None:
         )
 
 
+def _add_oct_json_column(
+    db,
+    directory_id: str,
+    key: str,
+    title: str,
+    *,
+    order: int = 100,
+) -> None:
+    db.add(
+        DatasetDynamicColumn(
+            directory_id=directory_id,
+            column_key=key,
+            column_title=title,
+            data_type="NUMBER",
+            source_type="OCT_JSON",
+            display_order=order,
+        )
+    )
+
+
 def test_directory_export_writes_merged_questionnaire_rows():
     directory_id = "dir_test_export_merged_rows"
     export_id = "exp_test_export_merged_rows"
@@ -179,6 +199,12 @@ def test_directory_export_writes_merged_questionnaire_rows():
             )
         )
         _add_questionnaire_columns(db, directory_id)
+        _add_oct_json_column(
+            db,
+            directory_id,
+            "od_Macular_Avg_Thickness_Nine_Central_Subfield",
+            "OD 中央凹厚度",
+        )
         db.merge(
             ExportRecord(
                 export_record_id=export_id,
@@ -224,13 +250,10 @@ def test_directory_export_writes_merged_questionnaire_rows():
         {
             "患者ID": "P_MERGED",
             "调查日期": "2026-06-01",
-            "JSON解析数据": json.dumps(
-                {"od_Macular_Avg_Thickness_Nine_Central_Subfield": 230.81205235860708},
-                ensure_ascii=False,
-                sort_keys=True,
-            ),
+            "OD 中央凹厚度": "230.81205235860708",
         }
     ]
+    assert "JSON解析数据" not in csv_rows[0]
 
 
 def test_patient_export_includes_patient_source_members_and_merged_fields():
@@ -282,6 +305,12 @@ def test_patient_export_includes_patient_source_members_and_merged_fields():
             )
         )
         _add_questionnaire_columns(db, directory_id)
+        _add_oct_json_column(
+            db,
+            directory_id,
+            "os_MacularGCC_Avg_Thickness_Six_Temporal_Superior",
+            "OS GCC 颞上厚度",
+        )
         db.merge(
             ExportRecord(
                 export_record_id=export_id,
@@ -321,9 +350,8 @@ def test_patient_export_includes_patient_source_members_and_merged_fields():
     assert csv_rows[0]["目录名称"] == "患者原图目录"
     assert csv_rows[0]["患者ID"] == "P_RAW"
     assert csv_rows[0]["调查日期"] == "2026-06-01"
-    assert json.loads(csv_rows[0]["JSON解析数据"]) == {
-        "os_MacularGCC_Avg_Thickness_Six_Temporal_Superior": 86.5296483909416
-    }
+    assert csv_rows[0]["OS GCC 颞上厚度"] == "86.5296483909416"
+    assert "JSON解析数据" not in csv_rows[0]
     assert "images/OCT/P_RAW/2026-06-01/report.bmp" in names
     assert "images/OCT/P_RAW/2026-06-01/capture.png" in names
     assert "images/OCT/P_RAW/2026-06-02/other-day.bmp" not in names
@@ -361,6 +389,18 @@ def test_patient_export_aggregates_same_patient_across_directories():
                 )
             )
             _add_questionnaire_columns(db, directory_id)
+        _add_oct_json_column(
+            db,
+            dir_a,
+            "od_Macular_Avg_Thickness_Nine_Central_Subfield",
+            "OD 中央凹厚度",
+        )
+        _add_oct_json_column(
+            db,
+            dir_b,
+            "os_MacularGCC_Avg_Thickness_Six_Temporal_Superior",
+            "OS GCC 颞上厚度",
+        )
         db.merge(
             DatasetQuestionnaireRecord(
                 record_id="rec_test_patient_cross_a",
@@ -476,11 +516,10 @@ def test_patient_export_aggregates_same_patient_across_directories():
     assert len(csv_rows) == 2
     assert [r["目录名称"] for r in csv_rows] == ["跨目录A", "跨目录B"]
     assert [r["调查日期"] for r in csv_rows] == ["2026-06-01", "2026-07-01"]
-    assert json.loads(csv_rows[0]["JSON解析数据"]) == {
-        "od_Macular_Avg_Thickness_Nine_Central_Subfield": 210.5
-    }
-    assert json.loads(csv_rows[1]["JSON解析数据"]) == {
-        "os_MacularGCC_Avg_Thickness_Six_Temporal_Superior": 88.2
-    }
+    assert csv_rows[0]["OD 中央凹厚度"] == "210.5"
+    assert csv_rows[0]["OS GCC 颞上厚度"] == ""
+    assert csv_rows[1]["OD 中央凹厚度"] == ""
+    assert csv_rows[1]["OS GCC 颞上厚度"] == "88.2"
+    assert "JSON解析数据" not in csv_rows[0]
     assert "images/跨目录A/OCT/P_CROSS/2026-06-01/a.bmp" in names
     assert "images/跨目录B/OCT/P_CROSS/2026-07-01/b.bmp" in names
