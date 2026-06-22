@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import struct
@@ -14,7 +15,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 import numpy as np
 
 
-PARSER_VERSION = "newvision-oct-parser-v2-aspect-2to1"
+PARSER_VERSION = "newvision-oct-parser-v3-aspect-2to1-area-preserved"
 HEADER_SIZE = 1024
 TARGET_BSCAN_ASPECT_RATIO = 2.0
 
@@ -261,17 +262,33 @@ def open_oct_dat(
     return header, frames, signal
 
 
-def resize_width_to_aspect(
-    image: np.ndarray,
+def target_bscan_output_shape(
+    source_height: int,
+    source_width: int,
     *,
     aspect_ratio: float = TARGET_BSCAN_ASPECT_RATIO,
+) -> tuple[int, int]:
+    source_height = max(1, int(source_height))
+    source_width = max(1, int(source_width))
+    source_area = source_height * source_width
+    target_height = max(1, int(round(math.sqrt(source_area / aspect_ratio))))
+    target_width = max(1, int(round(target_height * aspect_ratio)))
+    return target_height, target_width
+
+
+def resize_gray_to_shape(
+    image: np.ndarray,
+    *,
+    target_height: int,
+    target_width: int,
 ) -> np.ndarray:
     image = np.asarray(image, dtype=np.uint8)
     if image.ndim != 2:
         raise ValueError(f"Expected a 2-D grayscale image, got shape={image.shape}")
     height, width = image.shape
-    target_width = max(1, int(round(height * aspect_ratio)))
-    if target_width == width:
+    target_height = max(1, int(target_height))
+    target_width = max(1, int(target_width))
+    if (target_height, target_width) == (height, width):
         return image.copy()
 
     xs = np.linspace(0, width - 1, target_width, dtype=np.float32)
@@ -280,7 +297,15 @@ def resize_width_to_aspect(
     alpha = (xs - x0).astype(np.float32)
     left = image[:, x0].astype(np.float32)
     right = image[:, x1].astype(np.float32)
-    resized = left * (1.0 - alpha) + right * alpha
+    horizontal = left * (1.0 - alpha) + right * alpha
+
+    ys = np.linspace(0, height - 1, target_height, dtype=np.float32)
+    y0 = np.floor(ys).astype(np.int32)
+    y1 = np.minimum(y0 + 1, height - 1)
+    beta = (ys - y0).astype(np.float32)[:, None]
+    top = horizontal[y0, :]
+    bottom = horizontal[y1, :]
+    resized = top * (1.0 - beta) + bottom * beta
     return np.clip(resized + 0.5, 0, 255).astype(np.uint8)
 
 
@@ -288,7 +313,12 @@ def frame_to_uint8(frame: np.ndarray, percentiles: Tuple[float, float] = (1, 99)
     image = frame.T[::-1, :].astype(np.float32)
     vmin, vmax = np.percentile(image, percentiles)
     scaled = np.clip((image - vmin) / (vmax - vmin + 1e-6), 0, 1)
-    return resize_width_to_aspect((scaled * 255).astype(np.uint8))
+    target_height, target_width = target_bscan_output_shape(*image.shape)
+    return resize_gray_to_shape(
+        (scaled * 255).astype(np.uint8),
+        target_height=target_height,
+        target_width=target_width,
+    )
 
 
 def save_frames_png(
@@ -403,8 +433,8 @@ def parse_oct_dat_bytes(
     reasons: list[str] = []
     if nframes > max_frames_in_file:
         reasons.append("frames")
-    output_width = int(round(h * TARGET_BSCAN_ASPECT_RATIO))
-    if w > max_dimension or h > max_dimension or output_width > max_dimension:
+    output_height, output_width = target_bscan_output_shape(h, w)
+    if w > max_dimension or h > max_dimension or output_width > max_dimension or output_height > max_dimension:
         reasons.append("dimensions")
     if reasons:
         return {

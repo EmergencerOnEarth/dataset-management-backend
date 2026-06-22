@@ -13,7 +13,7 @@ from sqlalchemy import select
 from backend.app.core.config import get_settings
 from backend.app.db.models import DatasetImageAsset, DatasetImageMetadata
 from backend.app.db.session import get_session_factory
-from backend.app.parsers.newvision_oct import TARGET_BSCAN_ASPECT_RATIO, gray_png_bytes
+from backend.app.parsers.newvision_oct import gray_png_bytes, resize_gray_to_shape, target_bscan_output_shape
 from backend.app.storage.backend import get_storage, normalize_storage_path
 
 
@@ -70,22 +70,6 @@ def _read_png_gray_filter0(data: bytes) -> np.ndarray:
     return np.vstack(rows)
 
 
-def _resize_width_to_aspect(image: np.ndarray, aspect_ratio: float = TARGET_BSCAN_ASPECT_RATIO) -> np.ndarray:
-    height, width = image.shape
-    target_width = max(1, int(round(height * aspect_ratio)))
-    if target_width == width:
-        return image.copy()
-
-    xs = np.linspace(0, width - 1, target_width, dtype=np.float32)
-    x0 = np.floor(xs).astype(np.int32)
-    x1 = np.minimum(x0 + 1, width - 1)
-    alpha = (xs - x0).astype(np.float32)
-    left = image[:, x0].astype(np.float32)
-    right = image[:, x1].astype(np.float32)
-    resized = left * (1.0 - alpha) + right * alpha
-    return np.clip(resized + 0.5, 0, 255).astype(np.uint8)
-
-
 def _frame_paths(img: DatasetImageAsset, meta: dict[str, Any] | None) -> list[str]:
     parsed = normalize_storage_path(img.parsed_path or "")
     if not parsed:
@@ -98,9 +82,22 @@ def _frame_paths(img: DatasetImageAsset, meta: dict[str, Any] | None) -> list[st
     return [parsed]
 
 
+def _source_shape_from_metadata(meta: dict[str, Any] | None) -> tuple[int, int] | None:
+    oct_dat = (meta or {}).get("octDat") or {}
+    scan = ((oct_dat.get("header") or {}).get("scan") or {})
+    try:
+        width = int(scan.get("nWidth") or 0)
+        height = int(scan.get("nHeight") or 0)
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return height, width
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Resize existing NewVision OCT parsed PNG frames to final width:height=2:1."
+        description="Resize existing NewVision OCT parsed PNG frames to area-preserved width:height=2:1."
     )
     parser.add_argument("--directory-id", action="append", default=[], help="Limit to a directoryId")
     parser.add_argument("--patient-id", action="append", default=[], help="Limit to a patientId")
@@ -133,10 +130,11 @@ def main() -> int:
         summary: dict[str, Any] = {
             "dryRun": args.dry_run,
             "targetAspectRatioWH": "2:1",
+            "targetSizing": "preserve original DAT pixel area when metadata is available",
             "imageCount": len(images),
             "framesSeen": 0,
             "framesWritten": 0,
-            "framesSkippedAlready2to1": 0,
+            "framesSkippedAlreadyTargetShape": 0,
             "errors": [],
             "images": [],
         }
@@ -152,22 +150,26 @@ def main() -> int:
                 "imageName": img.image_name,
                 "frameCount": len(frame_paths),
                 "written": 0,
-                "skippedAlready2to1": 0,
+                "skippedAlreadyTargetShape": 0,
                 "errors": [],
             }
+            source_shape = _source_shape_from_metadata(metadata)
             write_items: list[tuple[str, bytes]] = []
             for frame_path in frame_paths:
                 summary["framesSeen"] += 1
                 try:
                     raw = storage.get_bytes(frame_path)
                     image = _read_png_gray_filter0(raw)
-                    height, width = image.shape
-                    target_width = int(round(height * TARGET_BSCAN_ASPECT_RATIO))
-                    if width == target_width:
-                        summary["framesSkippedAlready2to1"] += 1
-                        image_summary["skippedAlready2to1"] += 1
+                    target_height, target_width = target_bscan_output_shape(*(source_shape or image.shape))
+                    if image.shape == (target_height, target_width):
+                        summary["framesSkippedAlreadyTargetShape"] += 1
+                        image_summary["skippedAlreadyTargetShape"] += 1
                         continue
-                    resized = _resize_width_to_aspect(image)
+                    resized = resize_gray_to_shape(
+                        image,
+                        target_height=target_height,
+                        target_width=target_width,
+                    )
                     if not args.dry_run:
                         write_items.append((frame_path, gray_png_bytes(resized)))
                     image_summary["written"] += 1

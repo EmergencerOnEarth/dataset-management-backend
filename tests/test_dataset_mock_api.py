@@ -1119,7 +1119,7 @@ def test_nv10_oct_dat_header_golden_file():
 
 
 def test_nv11_oct_dat_frame_output_aspect_2to1(tmp_path):
-    """NewVision B-scan display output should be resized to final width:height=2:1."""
+    """NewVision B-scan output should keep 2:1 aspect without increasing pixel load."""
     from backend.app.parsers.newvision_oct import parse_dat_file
 
     repo = Path(__file__).resolve().parents[1]
@@ -1136,5 +1136,7 @@ def test_nv11_oct_dat_frame_output_aspect_2to1(tmp_path):
     raw = frame0.read_bytes()[:24]
     assert raw.startswith(b"\x89PNG\r\n\x1a\n")
     width, height = struct.unpack(">II", raw[16:24])
-    assert (width, height) == (1400, 700)
     assert width / height == 2
+    source_area = int(result["header"]["scan"]["nWidth"]) * int(result["header"]["scan"]["nHeight"])
+    output_area = width * height
+    assert abs(output_area - source_area) / source_area < 0.01
