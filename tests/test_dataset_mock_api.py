@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import struct
 import time
 import zipfile
 from pathlib import Path
@@ -1115,3 +1116,25 @@ def test_nv10_oct_dat_header_golden_file():
     hdr = parse_oct_header(raw, prefer_time_t_8=True)
     assert hdr.signature.strip("\x00") == "EOD"
     assert hdr.scan.nFrames >= 1
+
+
+def test_nv11_oct_dat_frame_output_aspect_2to1(tmp_path):
+    """NewVision B-scan display output should be resized to final width:height=2:1."""
+    from backend.app.parsers.newvision_oct import parse_dat_file
+
+    repo = Path(__file__).resolve().parents[1]
+    dat_path = (
+        repo / "test-data/upload-samples/local/测试上传数据/中航数据/2026/OCT/2026-3-3/"
+        "X08-data(2026-03-03-2026-03-03)/database/info-data/50/LGTA00087/"
+        "x08-rds/20260303/od-3dscan-macular-20260303-092714-001.dat"
+    )
+    if not dat_path.is_file():
+        pytest.skip(f"missing golden sample: {dat_path}")
+
+    result = parse_dat_file(dat_path, output_dir=tmp_path / "frames", max_frames=1, mmap=False)
+    frame0 = Path(result["frames"][0])
+    raw = frame0.read_bytes()[:24]
+    assert raw.startswith(b"\x89PNG\r\n\x1a\n")
+    width, height = struct.unpack(">II", raw[16:24])
+    assert (width, height) == (1400, 700)
+    assert width / height == 2

@@ -14,8 +14,9 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 import numpy as np
 
 
-PARSER_VERSION = "newvision-oct-parser-v1"
+PARSER_VERSION = "newvision-oct-parser-v2-aspect-2to1"
 HEADER_SIZE = 1024
+TARGET_BSCAN_ASPECT_RATIO = 2.0
 
 
 class OctParseError(ValueError):
@@ -260,11 +261,34 @@ def open_oct_dat(
     return header, frames, signal
 
 
+def resize_width_to_aspect(
+    image: np.ndarray,
+    *,
+    aspect_ratio: float = TARGET_BSCAN_ASPECT_RATIO,
+) -> np.ndarray:
+    image = np.asarray(image, dtype=np.uint8)
+    if image.ndim != 2:
+        raise ValueError(f"Expected a 2-D grayscale image, got shape={image.shape}")
+    height, width = image.shape
+    target_width = max(1, int(round(height * aspect_ratio)))
+    if target_width == width:
+        return image.copy()
+
+    xs = np.linspace(0, width - 1, target_width, dtype=np.float32)
+    x0 = np.floor(xs).astype(np.int32)
+    x1 = np.minimum(x0 + 1, width - 1)
+    alpha = (xs - x0).astype(np.float32)
+    left = image[:, x0].astype(np.float32)
+    right = image[:, x1].astype(np.float32)
+    resized = left * (1.0 - alpha) + right * alpha
+    return np.clip(resized + 0.5, 0, 255).astype(np.uint8)
+
+
 def frame_to_uint8(frame: np.ndarray, percentiles: Tuple[float, float] = (1, 99)) -> np.ndarray:
     image = frame.T[::-1, :].astype(np.float32)
     vmin, vmax = np.percentile(image, percentiles)
     scaled = np.clip((image - vmin) / (vmax - vmin + 1e-6), 0, 1)
-    return (scaled * 255).astype(np.uint8)
+    return resize_width_to_aspect((scaled * 255).astype(np.uint8))
 
 
 def save_frames_png(
@@ -379,7 +403,8 @@ def parse_oct_dat_bytes(
     reasons: list[str] = []
     if nframes > max_frames_in_file:
         reasons.append("frames")
-    if w > max_dimension or h > max_dimension:
+    output_width = int(round(h * TARGET_BSCAN_ASPECT_RATIO))
+    if w > max_dimension or h > max_dimension or output_width > max_dimension:
         reasons.append("dimensions")
     if reasons:
         return {
